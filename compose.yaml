@@ -1,0 +1,18 @@
+services:
+  app:
+    build:
+      context: .
+      args:
+        INSTALL_DEV: "true"
+    ports:
+      - "8000:8000"
+    environment:
+      MAPILLARY_ACCESS_TOKEN: ${MAPILLARY_ACCESS_TOKEN:-}
+      MAPILLARY_CACHE_DIR: /app/data/cache
+      MAPILLARY_CACHE_TTL_SECONDS: ${MAPILLARY_CACHE_TTL_SECONDS:-86400}
+      MAPILLARY_MAX_IMAGES_PER_GRID: ${MAPILLARY_MAX_IMAGES_PER_GRID:-2000}
+    volumes:
+      - mapillary-cache:/app/data/cache
+
+volumes:
+  mapillary-cache:

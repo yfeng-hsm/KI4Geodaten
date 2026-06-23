@@ -11,6 +11,18 @@ from psycopg.rows import dict_row
 from app.ollama import VLM_FIELDS
 
 
+def preferred_mapillary_geometry(
+    geometry: dict[str, Any] | None,
+    image_properties: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    properties = image_properties or {}
+    return (
+        properties.get("computed_geometry")
+        or properties.get("original_geometry")
+        or geometry
+    )
+
+
 @dataclass(frozen=True)
 class VLMAnalysisStore:
     database_url: str | None
@@ -176,6 +188,28 @@ class VLMAnalysisStore:
             )
         return int(result.rowcount or 0)
 
+    def migrate_geometry_to_mapillary_computed(self) -> int:
+        if not self.database_url:
+            return 0
+        self.ensure_schema()
+        with self._connect() as conn:
+            result = conn.execute(
+                """
+                UPDATE vlm_image_analysis
+                SET geometry = COALESCE(
+                        image_properties->'computed_geometry',
+                        image_properties->'original_geometry',
+                        geometry
+                    )
+                WHERE geometry IS DISTINCT FROM COALESCE(
+                        image_properties->'computed_geometry',
+                        image_properties->'original_geometry',
+                        geometry
+                    )
+                """
+            )
+        return int(result.rowcount or 0)
+
     def claim_next_job(self) -> dict[str, Any] | None:
         if not self.database_url:
             return None
@@ -325,6 +359,8 @@ class VLMAnalysisStore:
         fields = {field: result.get(field) for field in VLM_FIELDS}
         fields["confidence"] = result.get("confidence")
         fields["reason"] = result.get("reason")
+        image_properties = result.get("image_properties") or {}
+        geometry = preferred_mapillary_geometry(result.get("geometry"), image_properties)
         now = datetime.now(timezone.utc)
         with self._connect() as conn:
             row = conn.execute(
@@ -349,8 +385,8 @@ class VLMAnalysisStore:
                     grid_id,
                     result.get("model", ""),
                     result.get("prompt_version", ""),
-                    json.dumps(result.get("geometry"), ensure_ascii=False),
-                    json.dumps(result.get("image_properties"), ensure_ascii=False),
+                    json.dumps(geometry, ensure_ascii=False),
+                    json.dumps(image_properties, ensure_ascii=False),
                     json.dumps(fields, ensure_ascii=False),
                     json.dumps(result, ensure_ascii=False),
                     result.get("error"),

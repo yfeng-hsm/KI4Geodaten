@@ -12,3 +12,4 @@ def test_osm_store_without_database_is_unavailable():
 
     assert result["available"] is False
     assert result["layers"]["roads"]["features"] == []
+    assert store.road_vlm_matches(1) is None

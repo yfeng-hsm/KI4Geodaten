@@ -14,6 +14,7 @@ map.createPane("buildingPane");
 map.createPane("pedestrianRoadPane");
 map.createPane("vehicleRoadPane");
 map.createPane("bicycleRoadPane");
+map.createPane("roadMatchPane");
 map.createPane("vlmResultPane");
 map.createPane("mapillaryImagePane");
 map.createPane("gridPane");
@@ -21,11 +22,12 @@ map.createPane("boundaryPane");
 map.getPane("landusePane").style.zIndex = 410;
 map.getPane("gridPane").style.zIndex = 420;
 map.getPane("buildingPane").style.zIndex = 430;
-map.getPane("vehicleRoadPane").style.zIndex = 450;
-map.getPane("bicycleRoadPane").style.zIndex = 455;
-map.getPane("pedestrianRoadPane").style.zIndex = 460;
+map.getPane("bicycleRoadPane").style.zIndex = 450;
+map.getPane("pedestrianRoadPane").style.zIndex = 455;
+map.getPane("vehicleRoadPane").style.zIndex = 460;
 map.getPane("boundaryPane").style.zIndex = 460;
 map.getPane("vlmResultPane").style.zIndex = 500;
+map.getPane("roadMatchPane").style.zIndex = 505;
 map.getPane("mapillaryImagePane").style.zIndex = 510;
 map.getPane("landusePane").style.pointerEvents = "none";
 map.getPane("buildingPane").style.pointerEvents = "none";
@@ -35,16 +37,20 @@ map.getPane("bicycleRoadPane").style.pointerEvents = "none";
 map.getPane("gridPane").style.pointerEvents = "auto";
 map.getPane("boundaryPane").style.pointerEvents = "none";
 map.getPane("vlmResultPane").style.pointerEvents = "none";
+map.getPane("roadMatchPane").style.pointerEvents = "auto";
 map.getPane("mapillaryImagePane").style.pointerEvents = "none";
 
 const gridRenderer = L.canvas({ pane: "gridPane", padding: 0.4 });
 const landuseRenderer = L.canvas({ pane: "landusePane", padding: 0.4 });
 const buildingRenderer = L.canvas({ pane: "buildingPane", padding: 0.4 });
-const pedestrianRoadRenderer = L.canvas({ pane: "pedestrianRoadPane", padding: 0.4 });
-const vehicleRoadRenderer = L.canvas({ pane: "vehicleRoadPane", padding: 0.4 });
-const bicycleRoadRenderer = L.canvas({ pane: "bicycleRoadPane", padding: 0.4 });
+const pedestrianRoadRenderer = L.canvas({ pane: "pedestrianRoadPane", padding: 0.4, tolerance: 8 });
+const vehicleRoadRenderer = L.canvas({ pane: "vehicleRoadPane", padding: 0.4, tolerance: 8 });
+const bicycleRoadRenderer = L.canvas({ pane: "bicycleRoadPane", padding: 0.4, tolerance: 8 });
 const vlmResultRenderer = L.svg({ pane: "vlmResultPane", padding: 0.4 });
+const roadMatchRenderer = L.svg({ pane: "roadMatchPane", padding: 0.4 });
 let selectedGridLayer = null;
+let selectedRoadFeature = null;
+let currentRoadFeatures = [];
 let currentGrid = null;
 let currentImageFeature = null;
 let currentImageFeatures = [];
@@ -105,6 +111,11 @@ const gridLayer = L.geoJSON(null, {
   onEachFeature: (feature, layer) => {
     layer.on("click", (event) => {
       L.DomEvent.stopPropagation(event);
+      const roadFeature = nearestRoadFeatureAtLatLng(event.latlng);
+      if (roadFeature) {
+        selectRoadForVlmMatching(roadFeature, event.latlng);
+        return;
+      }
       selectGrid(feature, layer);
     });
   },
@@ -214,6 +225,60 @@ const pedestrianRoadLayer = createRoadLayer(pedestrianRoadRenderer);
 const vehicleRoadLayer = createRoadLayer(vehicleRoadRenderer);
 const bicycleRoadLayer = createRoadLayer(bicycleRoadRenderer);
 
+const selectedRoadLayer = L.geoJSON(null, {
+  pane: "roadMatchPane",
+  interactive: true,
+  renderer: roadMatchRenderer,
+  style: { color: "#f2a900", weight: 7, opacity: 0.9 },
+  onEachFeature: (feature, layer) => {
+    layer.bindPopup(roadPopupHtml(feature.properties || {}), {
+      maxWidth: 360,
+      className: "road-popup",
+    });
+  },
+});
+
+const roadMatchLinkLayer = L.geoJSON(null, {
+  pane: "roadMatchPane",
+  interactive: false,
+  renderer: roadMatchRenderer,
+  style: {
+    color: "#18201d",
+    weight: 2.4,
+    opacity: 0.85,
+    dashArray: "6 6",
+  },
+});
+
+const roadMatchPointLayer = L.geoJSON(null, {
+  pane: "roadMatchPane",
+  pointToLayer: (feature, latlng) => L.circleMarker(latlng, {
+    pane: "roadMatchPane",
+    renderer: roadMatchRenderer,
+    radius: 6,
+    color: "#ffffff",
+    weight: 2,
+    fillColor: roadColor(feature.properties.road_category),
+    fillOpacity: 1,
+    interactive: true,
+  }),
+  onEachFeature: (feature, layer) => {
+    layer.on("click", (event) => {
+      L.DomEvent.stopPropagation(event);
+      showStoredVlmPoint(feature.properties.image_id);
+    });
+  },
+});
+
+const roadMatchLayerGroup = L.layerGroup([
+  selectedRoadLayer,
+  roadMatchLinkLayer,
+  roadMatchPointLayer,
+]).addTo(map);
+selectedRoadLayer.addTo(map);
+roadMatchLinkLayer.addTo(map);
+roadMatchPointLayer.addTo(map);
+
 L.control.layers(
   { OpenStreetMap: osmBasemap },
   {
@@ -226,6 +291,7 @@ L.control.layers(
     "OSM landuse in selected cell": landuseLayer,
     "Mapillary images": imageLayer,
     "VLM result thematic points": vlmResultLayer,
+    "Road-VLM match links": roadMatchLayerGroup,
   },
   { collapsed: false, position: "topright" }
 ).addTo(map);
@@ -427,6 +493,11 @@ async function loadCellMapLayers(gridId) {
     landuseLayer.addData(result.layers.landuse);
     buildingLayer.addData(result.layers.buildings);
     const roads = splitRoads(result.layers.roads.features);
+    currentRoadFeatures = [
+      ...roads.pedestrian,
+      ...roads.vehicle,
+      ...roads.bicycle,
+    ];
     pedestrianRoadLayer.addData(featureCollection(roads.pedestrian));
     vehicleRoadLayer.addData(featureCollection(roads.vehicle));
     bicycleRoadLayer.addData(featureCollection(roads.bicycle));
@@ -447,26 +518,55 @@ function createRoadLayer(renderer) {
       weight: roadWeight(feature.properties.road_category),
       opacity: 1,
     }),
-    onEachFeature: (feature, layer) => {
-      const properties = feature.properties;
-      const roadUrl = `/api/osm/roads/${encodeURIComponent(properties.osm_id)}`;
-      layer.bindPopup(`
-        <div class="road-popup">
-          <strong>${escapeHtml(properties.name || properties.highway || "Road")}</strong>
-          类型=${escapeHtml(roadCategoryLabel(properties.road_category))}<br>
-          highway=${escapeHtml(properties.highway || "unknown")}<br>
-          cell内长度 ${formatMetric(properties.length_m, " m", 1)}<br>
-          <a href="${roadUrl}" target="_blank" rel="noreferrer">打开整条道路 GeoJSON</a>
-        </div>
-      `);
-    },
   }).addTo(map);
 }
 
 function clearRoadLayers() {
+  currentRoadFeatures = [];
   pedestrianRoadLayer.clearLayers();
   vehicleRoadLayer.clearLayers();
   bicycleRoadLayer.clearLayers();
+  clearRoadVlmMatches();
+}
+
+function clearRoadVlmMatches() {
+  selectedRoadFeature = null;
+  selectedRoadLayer.clearLayers();
+  roadMatchLinkLayer.clearLayers();
+  roadMatchPointLayer.clearLayers();
+}
+
+async function selectRoadForVlmMatching(feature, clickLatLng = null) {
+  const properties = feature.properties || {};
+  selectedRoadFeature = feature;
+  selectedRoadLayer.clearLayers();
+  roadMatchLinkLayer.clearLayers();
+  roadMatchPointLayer.clearLayers();
+  selectedRoadLayer.addData(feature);
+  selectedRoadLayer.bringToFront();
+  mapDataStatusElement.classList.remove("error");
+  mapDataStatusElement.textContent = `正在匹配道路 ${properties.osm_id} 与 VLM 图像点…`;
+  try {
+    const result = await apiGet(`/api/osm/roads/${encodeURIComponent(properties.osm_id)}/vlm-matches?max_distance_m=35&close_override_m=5&view_fov_deg=110&no_heading_visible_m=5&road_axis_tolerance_deg=35&limit=300`);
+    if (!selectedRoadFeature || selectedRoadFeature.properties.osm_id !== properties.osm_id) return;
+    selectedRoadLayer.clearLayers();
+    selectedRoadLayer.addData(result.road);
+    roadMatchLinkLayer.clearLayers();
+    roadMatchPointLayer.clearLayers();
+    roadMatchLinkLayer.addData(result.matches);
+    roadMatchPointLayer.addData(result.points);
+    selectedRoadLayer.bringToFront();
+    roadMatchLinkLayer.bringToFront();
+    roadMatchPointLayer.bringToFront();
+    if (clickLatLng) {
+      selectedRoadLayer.eachLayer((layer) => layer.openPopup(clickLatLng));
+    }
+    const label = roadCategoryLabel(result.meta.road_category);
+    mapDataStatusElement.textContent = `选中道路（${label}）匹配到 ${result.meta.count} 个 VLM 点；规则：每个图像点只分配一条最近兼容道路；汽车点只能匹配车行道路，行人/自行车点可匹配车行道路；道路最近点在 ${result.meta.view_fov_deg}° 前方视野内，或图像朝向与道路轴线相差不超过 ${result.meta.road_axis_tolerance_deg}°；无朝向历史点只保留 ${result.meta.no_heading_visible_m}m 内最近道路。`;
+  } catch (error) {
+    mapDataStatusElement.textContent = `道路匹配失败：${error.message}`;
+    mapDataStatusElement.classList.add("error");
+  }
 }
 
 function splitRoads(features) {
@@ -477,6 +577,51 @@ function splitRoads(features) {
     groups[category].push(feature);
   });
   return groups;
+}
+
+function nearestRoadFeatureAtLatLng(latlng) {
+  if (!currentRoadFeatures.length) return null;
+  const clickPoint = map.latLngToLayerPoint(latlng);
+  let nearest = null;
+  let nearestDistance = Infinity;
+  currentRoadFeatures.forEach((feature) => {
+    const distance = featurePixelDistance(feature, clickPoint);
+    if (distance < nearestDistance) {
+      nearest = feature;
+      nearestDistance = distance;
+    }
+  });
+  return nearestDistance <= 12 ? nearest : null;
+}
+
+function featurePixelDistance(feature, clickPoint) {
+  const geometry = feature.geometry || {};
+  const lines = geometry.type === "LineString"
+    ? [geometry.coordinates]
+    : geometry.type === "MultiLineString"
+      ? geometry.coordinates
+      : [];
+  let minDistance = Infinity;
+  lines.forEach((line) => {
+    for (let index = 1; index < line.length; index += 1) {
+      const start = coordinateToLayerPoint(line[index - 1]);
+      const end = coordinateToLayerPoint(line[index]);
+      minDistance = Math.min(minDistance, pointToSegmentDistance(clickPoint, start, end));
+    }
+  });
+  return minDistance;
+}
+
+function coordinateToLayerPoint(coordinate) {
+  return map.latLngToLayerPoint(L.latLng(Number(coordinate[1]), Number(coordinate[0])));
+}
+
+function pointToSegmentDistance(point, start, end) {
+  const dx = end.x - start.x;
+  const dy = end.y - start.y;
+  if (dx === 0 && dy === 0) return point.distanceTo(start);
+  const t = Math.max(0, Math.min(1, ((point.x - start.x) * dx + (point.y - start.y) * dy) / (dx * dx + dy * dy)));
+  return point.distanceTo(L.point(start.x + t * dx, start.y + t * dy));
 }
 
 function featureCollection(features) {
@@ -499,12 +644,78 @@ function roadCategoryLabel(category) {
   return "车行道路";
 }
 
+function roadPopupHtml(properties) {
+  const tags = properties.tags || {};
+  const surface = properties.surface || tags.surface || "unknown";
+  const stats = properties.match_stats || {};
+  return `
+    <div class="road-popup-content">
+      <strong>${escapeHtml(properties.name || properties.highway || "OSM road")}</strong>
+      <dl>
+        <dt>类型</dt><dd>${escapeHtml(roadCategoryLabel(properties.road_category))}</dd>
+        <dt>highway</dt><dd>${escapeHtml(properties.highway || "unknown")}</dd>
+        <dt>surface</dt><dd>${escapeHtml(surface)}</dd>
+        <dt>maxspeed</dt><dd>${escapeHtml(properties.maxspeed || tags.maxspeed || "unknown")}</dd>
+        <dt>oneway</dt><dd>${escapeHtml(properties.oneway || tags.oneway || "unknown")}</dd>
+        <dt>access</dt><dd>${escapeHtml(tags.access || "unknown")}</dd>
+      </dl>
+      <div class="road-popup-section">
+        <strong>匹配统计</strong>
+        ${formatRoadStats(stats)}
+      </div>
+    </div>
+  `;
+}
+
+function formatRoadStats(stats) {
+  const sections = [
+    ["拍摄位置", stats.capture_position],
+    ["路面材料", stats.surface_material],
+    ["图像道路类别", stats.image_road_category],
+    ["traffic_signal", stats.traffic_signal],
+    ["bench", stats.bench],
+    ["waste_basket", stats.waste_basket],
+    ["独立自行车路", stats.independent_bicycle_road],
+    ["独立人行道路", stats.independent_pedestrian_road],
+  ];
+  const rows = sections
+    .filter(([, counts]) => counts && Object.keys(counts).length)
+    .map(([label, counts]) => `<dt>${escapeHtml(label)}</dt><dd>${escapeHtml(formatCounts(counts))}</dd>`);
+  if (!rows.length) return `<p class="muted">当前没有匹配的 VLM 点。</p>`;
+  return `<dl>${rows.join("")}</dl>`;
+}
+
+function formatCounts(counts) {
+  return Object.entries(counts)
+    .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+    .map(([key, value]) => `${key}: ${value}`)
+    .join(" · ");
+}
+
 function zoomToCurrentGrid() {
   if (!selectedGridLayer) return;
   map.fitBounds(selectedGridLayer.getBounds(), {
     padding: [140, 140],
     maxZoom: 17,
   });
+}
+
+async function selectGridByPoint(latlng) {
+  try {
+    const feature = await apiGet(`/api/grids/by-point?longitude=${encodeURIComponent(latlng.lng)}&latitude=${encodeURIComponent(latlng.lat)}`);
+    let matchingLayer = null;
+    gridLayer.eachLayer((layer) => {
+      if (layer.feature?.properties?.grid_id === feature.properties.grid_id) {
+        matchingLayer = layer;
+      }
+    });
+    if (matchingLayer) {
+      selectGrid(matchingLayer.feature, matchingLayer);
+    }
+  } catch (error) {
+    loadStatusElement.textContent = `格网选择失败：${error.message}`;
+    loadStatusElement.classList.add("error");
+  }
 }
 
 async function loadImages() {
@@ -1170,6 +1381,14 @@ map.on("zoomend", () => {
       opacity: 1,
     }));
   });
+});
+map.on("click", (event) => {
+  const roadFeature = nearestRoadFeatureAtLatLng(event.latlng);
+  if (roadFeature) {
+    selectRoadForVlmMatching(roadFeature, event.latlng);
+    return;
+  }
+  selectGridByPoint(event.latlng);
 });
 checkHealth();
 initializeMainz();

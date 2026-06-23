@@ -124,6 +124,9 @@ docker compose run --rm app pytest
 - `GET /api/mainz/grids/{grid_id}`
 - `GET /api/mainz/grids/{grid_id}/map-layers`
 - `GET /api/osm/roads/{osm_id}`
+- `GET /api/osm/roads/{osm_id}/vlm-matches`
+  - 参数：`max_distance_m` 默认 35，`close_override_m` 默认 5，`view_fov_deg` 默认 110，`on_road_visible_m` 默认 1，`no_heading_visible_m` 默认 5，`road_axis_tolerance_deg` 默认 35，`limit` 默认 200。
+  - 匹配规则：每个 VLM 图像点只分配给一条兼容道路；`vehicle_road` 只能匹配车行道路，`pedestrian_road` 和 `bicycle_road` 可以匹配车行道路。优先选择 5m 内最近兼容道路，否则选择 35m 内同类型最近道路。匹配还需要满足道路最近点落在图像前方视野锥内，或图像朝向与最近道路段轴线基本一致。图像点距离道路不超过 1m 时视为站在道路上，保留匹配；无朝向历史点只保留 5m 内最近道路。
 - `GET /api/grids/by-point?longitude=13.4095&latitude=52.5208`
 - `GET /api/grids/around?longitude=13.4095&latitude=52.5208&radius=4`
 - `GET /api/grids/{grid_id}/images`

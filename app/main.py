@@ -36,6 +36,7 @@ async def lifespan(app: FastAPI):
     app.state.ollama = OllamaClient(settings)
     app.state.vlm_store = VLMAnalysisStore(settings.database_url)
     app.state.vlm_store.ensure_schema()
+    app.state.vlm_store.migrate_geometry_to_mapillary_computed()
     app.state.vlm_store.recover_interrupted_jobs()
     app.state.vlm_queue_event = asyncio.Event()
     app.state.vlm_worker_task = asyncio.create_task(_vlm_queue_worker(app))
@@ -125,6 +126,33 @@ async def osm_road(osm_id: int, request: Request) -> dict:
     if road is None:
         raise HTTPException(status_code=404, detail="OSM road is not available")
     return road
+
+
+@app.get("/api/osm/roads/{osm_id}/vlm-matches")
+async def osm_road_vlm_matches(
+    osm_id: int,
+    request: Request,
+    max_distance_m: float = Query(default=35, ge=1, le=200),
+    close_override_m: float = Query(default=5, ge=0, le=50),
+    view_fov_deg: float = Query(default=110, ge=30, le=180),
+    on_road_visible_m: float = Query(default=1, ge=0, le=10),
+    no_heading_visible_m: float = Query(default=5, ge=0, le=20),
+    road_axis_tolerance_deg: float = Query(default=35, ge=0, le=90),
+    limit: int = Query(default=200, ge=1, le=1000),
+) -> dict:
+    matches = request.app.state.osm.road_vlm_matches(
+        osm_id,
+        max_distance_m=max_distance_m,
+        close_override_m=close_override_m,
+        view_fov_deg=view_fov_deg,
+        on_road_visible_m=on_road_visible_m,
+        no_heading_visible_m=no_heading_visible_m,
+        road_axis_tolerance_deg=road_axis_tolerance_deg,
+        limit=limit,
+    )
+    if matches is None:
+        raise HTTPException(status_code=404, detail="OSM road VLM matches are not available")
+    return matches
 
 
 @app.post("/api/vlm/analyze-image")

@@ -36,8 +36,17 @@ async def lifespan(app: FastAPI):
     app.state.ollama = OllamaClient(settings)
     app.state.vlm_store = VLMAnalysisStore(settings.database_url)
     app.state.vlm_store.ensure_schema()
-    app.state.vlm_jobs = {}
-    yield
+    app.state.vlm_store.recover_interrupted_jobs()
+    app.state.vlm_queue_event = asyncio.Event()
+    app.state.vlm_worker_task = asyncio.create_task(_vlm_queue_worker(app))
+    try:
+        yield
+    finally:
+        app.state.vlm_worker_task.cancel()
+        try:
+            await app.state.vlm_worker_task
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(
@@ -143,7 +152,8 @@ async def analyze_image(payload: dict, request: Request) -> dict:
 
 @app.get("/api/grids/{grid_id}/vlm-results")
 async def vlm_results_for_grid(grid_id: str, request: Request) -> dict:
-    return request.app.state.vlm_store.results_for_grid(grid_id)
+    result = request.app.state.vlm_store.results_for_grid(grid_id)
+    return _enrich_vlm_results_from_cache(result, request.app.state.mapillary.cached_image_index())
 
 
 @app.get("/api/vlm-results")
@@ -151,11 +161,14 @@ async def all_vlm_results(
     request: Request,
     limit: int = Query(default=5000, ge=1, le=50000),
 ) -> dict:
-    return request.app.state.vlm_store.all_results(limit=limit)
+    result = request.app.state.vlm_store.all_results(limit=limit)
+    return _enrich_vlm_results_from_cache(result, request.app.state.mapillary.cached_image_index())
 
 
 @app.post("/api/grids/{grid_id}/vlm-jobs")
 async def start_vlm_job(grid_id: str, payload: dict, request: Request) -> dict:
+    if not request.app.state.vlm_store.configured:
+        raise HTTPException(status_code=503, detail="DATABASE_URL is required for VLM job queue")
     images = payload.get("images")
     if not isinstance(images, list) or not images:
         raise HTTPException(status_code=422, detail="images list is required")
@@ -163,74 +176,146 @@ async def start_vlm_job(grid_id: str, payload: dict, request: Request) -> dict:
     model = str(payload.get("model") or request.app.state.settings.ollama_model)
     force = bool(payload.get("force") or payload.get("overwrite_existing"))
     job_id = uuid4().hex
-    now = datetime.now(timezone.utc).isoformat()
-    request.app.state.vlm_jobs[job_id] = {
-        "job_id": job_id,
-        "grid_id": grid_id,
-        "model": model,
-        "force": force,
-        "status": "queued",
-        "total": len(images),
-        "processed": 0,
-        "analyzed": 0,
-        "skipped": 0,
-        "failed": 0,
-        "current_image_id": None,
-        "last_stored_image_id": None,
-        "started_at": now,
-        "updated_at": now,
-        "completed_at": None,
-        "error": None,
-    }
-    asyncio.create_task(_run_vlm_job(request.app, job_id, grid_id, images, model, force))
-    return request.app.state.vlm_jobs[job_id]
+    job = request.app.state.vlm_store.create_job(job_id, grid_id, model, force, images)
+    request.app.state.vlm_queue_event.set()
+    return job
+
+
+@app.get("/api/vlm/jobs")
+async def vlm_jobs(
+    request: Request,
+    limit: int = Query(default=20, ge=1, le=100),
+) -> dict:
+    return request.app.state.vlm_store.list_jobs(limit=limit)
 
 
 @app.get("/api/vlm/jobs/{job_id}")
 async def vlm_job_status(job_id: str, request: Request) -> dict:
-    job = request.app.state.vlm_jobs.get(job_id)
+    job = request.app.state.vlm_store.job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="VLM job not found")
     return job
 
 
-async def _run_vlm_job(
-    app: FastAPI, job_id: str, grid_id: str, images: list, model: str, force: bool
-) -> None:
-    job = app.state.vlm_jobs[job_id]
-    job["status"] = "running"
-    job["updated_at"] = datetime.now(timezone.utc).isoformat()
+async def _vlm_queue_worker(app: FastAPI) -> None:
+    while True:
+        job = await asyncio.to_thread(app.state.vlm_store.claim_next_job)
+        if job is None:
+            try:
+                await asyncio.wait_for(app.state.vlm_queue_event.wait(), timeout=2)
+                app.state.vlm_queue_event.clear()
+            except asyncio.TimeoutError:
+                pass
+            continue
+        await _run_vlm_job(app, job)
+
+
+async def _run_vlm_job(app: FastAPI, job: dict) -> None:
+    job_id = job["job_id"]
+    grid_id = job["grid_id"]
+    model = job["model"]
+    force = job["force"]
+    images = [item["image"] for item in job["items"]]
+    processed = job["processed"]
+    analyzed = job["analyzed"]
+    skipped = job["skipped"]
+    failed = job["failed"]
     try:
         image_ids = [_image_id(image) for image in images]
         existing_ids = set() if force else app.state.vlm_store.existing_image_ids(image_ids)
         async with httpx.AsyncClient(timeout=app.state.settings.ollama_timeout_seconds) as client:
             for image in images:
                 image_id = _image_id(image)
-                job["current_image_id"] = image_id
+                app.state.vlm_store.update_job(
+                    job_id,
+                    current_image_id=image_id,
+                    processed=processed,
+                    analyzed=analyzed,
+                    skipped=skipped,
+                    failed=failed,
+                )
+                app.state.vlm_store.update_job_item(job_id, image_id, "running")
                 if image_id in existing_ids:
-                    job["skipped"] += 1
-                    job["processed"] += 1
-                    job["updated_at"] = datetime.now(timezone.utc).isoformat()
+                    skipped += 1
+                    processed += 1
+                    app.state.vlm_store.update_job_item(job_id, image_id, "skipped")
+                    app.state.vlm_store.update_job(
+                        job_id,
+                        processed=processed,
+                        skipped=skipped,
+                        current_image_id=None,
+                    )
                     continue
                 result = await app.state.ollama.analyze_one(client, image, model)
                 if not result.get("ok"):
-                    job["failed"] += 1
+                    failed += 1
                 stored = app.state.vlm_store.upsert(grid_id, result)
-                job["last_stored_image_id"] = stored["image_id"]
-                job["analyzed"] += 1
-                job["processed"] += 1
-                job["updated_at"] = datetime.now(timezone.utc).isoformat()
-        job["status"] = "completed"
-        job["completed_at"] = datetime.now(timezone.utc).isoformat()
-        job["current_image_id"] = None
+                analyzed += 1
+                processed += 1
+                app.state.vlm_store.update_job_item(
+                    job_id,
+                    image_id,
+                    "failed" if result.get("error") else "completed",
+                    result.get("error"),
+                )
+                app.state.vlm_store.update_job(
+                    job_id,
+                    processed=processed,
+                    analyzed=analyzed,
+                    failed=failed,
+                    current_image_id=None,
+                    last_stored_image_id=stored["image_id"],
+                )
+        app.state.vlm_store.update_job(
+            job_id,
+            status="completed",
+            completed_at=datetime.now(timezone.utc),
+            current_image_id=None,
+        )
     except Exception as exc:  # pragma: no cover - defensive job boundary
-        job["status"] = "failed"
-        job["error"] = f"{exc.__class__.__name__}: {exc}"
-        job["updated_at"] = datetime.now(timezone.utc).isoformat()
+        app.state.vlm_store.update_job(
+            job_id,
+            status="failed",
+            error=f"{exc.__class__.__name__}: {exc}",
+            current_image_id=None,
+        )
 
 
 def _image_id(image: dict) -> str:
     return str(image.get("id") or image.get("properties", {}).get("id") or "")
+
+
+def _enrich_vlm_results_from_cache(result: dict, cached_images: dict[str, dict]) -> dict:
+    for image_id, analysis in result.get("results", {}).items():
+        cached = cached_images.get(str(image_id))
+        if not cached:
+            analysis["geometry"] = analysis.get("geometry") or _cell_center_geometry(
+                analysis.get("grid_id", "")
+            )
+            continue
+        analysis["geometry"] = analysis.get("geometry") or cached.get("geometry")
+        cached_properties = cached.get("properties") or {}
+        image_properties = analysis.get("image_properties") or {}
+        analysis["image_properties"] = {**cached_properties, **image_properties}
+        analysis["geometry"] = analysis.get("geometry") or _cell_center_geometry(
+            analysis.get("grid_id", "")
+        )
+    return result
+
+
+def _cell_center_geometry(grid_id: str) -> dict | None:
+    try:
+        ring = cell_from_id(grid_id).ring_wgs84
+    except ValueError:
+        return None
+    west = min(coordinate[0] for coordinate in ring)
+    east = max(coordinate[0] for coordinate in ring)
+    south = min(coordinate[1] for coordinate in ring)
+    north = max(coordinate[1] for coordinate in ring)
+    return {
+        "type": "Point",
+        "coordinates": [(west + east) / 2, (south + north) / 2],
+    }
 
 
 @app.get("/api/grids/by-point")

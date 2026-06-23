@@ -50,6 +50,7 @@ let currentImageFeature = null;
 let currentImageFeatures = [];
 let vlmResultsByImageId = {};
 let allVlmResultsByImageId = {};
+let currentCellProcessPlan = emptyProcessPlan();
 let mapillaryGeometryMode = "original";
 let requestSequence = 0;
 let cellMapSequence = 0;
@@ -82,6 +83,8 @@ const VLM_THEME_FIELDS = [
   "independent_bicycle_road",
   "independent_pedestrian_road",
 ];
+
+const CELL_PROCESS_DISTANCE_METERS = 5;
 
 function censusGridStyle(feature) {
   const population = feature.properties.population;
@@ -141,11 +144,11 @@ const vlmResultLayer = L.geoJSON(null, {
   pane: "vlmResultPane",
   pointToLayer: (feature, latlng) => L.circleMarker(latlng, {
     pane: "vlmResultPane",
-    radius: 7,
-    color: "#ffffff",
-    weight: 2,
+    radius: 8,
+    color: "#18201d",
+    weight: 3,
     fillColor: vlmThemeColor(feature.properties.theme_value),
-    fillOpacity: 0.9,
+    fillOpacity: 0.95,
     className: "vlm-result-point",
     interactive: true,
     renderer: vlmResultRenderer,
@@ -238,12 +241,15 @@ const mapillaryGeometryModeSelect = document.getElementById("mapillary-geometry-
 const mapillaryHealthElement = document.getElementById("mapillary-health");
 const modelHealthElement = document.getElementById("model-health");
 const modelSelectElement = document.getElementById("model-select");
+const detailScrollElement = document.querySelector(".detail-scroll");
 const imageDetailElement = document.getElementById("image-detail");
 const processCellVlmButton = document.getElementById("process-cell-vlm-button");
 const vlmProgressElement = document.getElementById("vlm-progress");
 const vlmStatusElement = document.getElementById("vlm-status");
 const forceVlmCheckbox = document.getElementById("force-vlm-checkbox");
 const vlmThemeSelect = document.getElementById("vlm-theme-select");
+const refreshJobsButton = document.getElementById("refresh-vlm-jobs-button");
+const vlmJobsElement = document.getElementById("vlm-jobs");
 const censusPopulationElement = document.getElementById("census-population");
 const censusAverageAgeElement = document.getElementById("census-average-age");
 const censusForeignersElement = document.getElementById("census-foreigners");
@@ -382,6 +388,7 @@ function selectGrid(feature, layer) {
   currentImageFeature = null;
   currentImageFeatures = [];
   vlmResultsByImageId = {};
+  currentCellProcessPlan = emptyProcessPlan();
   activeVlmJobId = null;
   stopVlmJobPolling();
   clearRoadLayers();
@@ -520,13 +527,14 @@ async function loadImages() {
     downloadLink.classList.remove("disabled");
     downloadLink.href = `/api/grids/${encodeURIComponent(gridId)}/images.geojson`;
     if (result.features.length === 0) showEmptyImageState();
-    updateProcessButtonState();
     await loadVlmResults(gridId);
+    refreshCellProcessPlan();
     confirmMapillaryButton.textContent = "Mapillary 已加载";
     confirmMapillaryButton.disabled = true;
   } catch (error) {
     if (sequence !== requestSequence) return;
     currentImageFeatures = [];
+    currentCellProcessPlan = emptyProcessPlan();
     updateProcessButtonState();
     imageCountElement.textContent = "0";
     setError(error.message);
@@ -551,6 +559,7 @@ async function loadVlmResults(gridId) {
         : `数据库已有 ${count} 张图像的 VLM 结果${latestText}。加载 Mapillary 图像后可处理当前 cell。`;
     }
     renderVlmResultLayer();
+    refreshCellProcessPlan();
     if (currentImageFeature) showImage(currentImageFeature);
   } catch (error) {
     if (sequence !== vlmResultsSequence) return;
@@ -587,22 +596,166 @@ function updateGlobalVlmStatus(totalProcessed) {
   vlmStatusElement.textContent = `数据库已有 ${totalProcessed} 张已处理图片；当前 cell ${currentCount} 张${latestText}。`;
 }
 
+async function loadVlmJobs() {
+  if (!vlmJobsElement) return;
+  try {
+    const result = await apiGet("/api/vlm/jobs?limit=10");
+    renderVlmJobs(result.jobs || []);
+  } catch (error) {
+    vlmJobsElement.textContent = `任务队列读取失败：${error.message}`;
+    vlmJobsElement.classList.add("error");
+  }
+}
+
+function renderVlmJobs(jobs) {
+  vlmJobsElement.classList.remove("error");
+  if (!jobs.length) {
+    vlmJobsElement.textContent = "暂无任务。点击 Process 后只会先加入队列。";
+    return;
+  }
+  vlmJobsElement.innerHTML = jobs.map((job) => {
+    const total = Number(job.total || 0);
+    const processed = Number(job.processed || 0);
+    const percent = total > 0 ? (processed / total) * 100 : 0;
+    const current = job.current_image_id ? ` · 当前 ${job.current_image_id}` : "";
+    const error = job.error ? ` · ${job.error}` : "";
+    return `
+      <div class="job-item">
+        <strong>${escapeHtml(job.status)} · ${processed}/${total} (${percent.toFixed(1)}%)</strong>
+        <div class="job-meta">${escapeHtml(job.grid_id || "unknown grid")} · ${escapeHtml(job.model || "model unknown")}</div>
+        <div class="job-meta">分析 ${Number(job.analyzed || 0)} · 跳过 ${Number(job.skipped || 0)} · 失败 ${Number(job.failed || 0)}${escapeHtml(current)}${escapeHtml(error)}</div>
+        <div class="job-meta">更新 ${escapeHtml(job.updated_at ? formatDate(job.updated_at) : "null")}</div>
+      </div>
+    `;
+  }).join("");
+}
+
+function emptyProcessPlan() {
+  return {
+    clusters: [],
+    representativeImages: [],
+    pendingImages: [],
+    totalClusters: 0,
+    processedClusters: 0,
+    redundantCount: 0,
+  };
+}
+
+function refreshCellProcessPlan() {
+  currentCellProcessPlan = buildCellProcessPlan();
+  updateCellProgressStatus();
+  updateProcessButtonState();
+}
+
+function buildCellProcessPlan() {
+  if (currentImageFeatures.length === 0) return emptyProcessPlan();
+  const clusters = [];
+  currentImageFeatures.forEach((feature) => {
+    const geometry = displayGeometry(feature);
+    const coordinates = geometry?.coordinates;
+    if (!Array.isArray(coordinates)) return;
+    let cluster = clusters.find((candidate) => (
+      distanceMeters(coordinates, candidate.representativeCoordinates) <= CELL_PROCESS_DISTANCE_METERS
+    ));
+    if (!cluster) {
+      cluster = {
+        representativeCoordinates: coordinates,
+        features: [],
+      };
+      clusters.push(cluster);
+    }
+    cluster.features.push(feature);
+  });
+
+  const representativeImages = [];
+  const pendingImages = [];
+  let processedClusters = 0;
+  clusters.forEach((cluster) => {
+    const processedFeature = cluster.features.find((feature) => hasVlmResult(feature.id));
+    const representative = processedFeature || cluster.features[0];
+    representativeImages.push(representative);
+    if (processedFeature) {
+      processedClusters += 1;
+    } else {
+      pendingImages.push(representative);
+    }
+  });
+
+  return {
+    clusters,
+    representativeImages,
+    pendingImages,
+    totalClusters: clusters.length,
+    processedClusters,
+    redundantCount: Math.max(currentImageFeatures.length - clusters.length, 0),
+  };
+}
+
+function hasVlmResult(imageId) {
+  const key = String(imageId);
+  return Boolean(vlmResultsByImageId[key] || allVlmResultsByImageId[key]);
+}
+
+function updateCellProgressStatus() {
+  if (!currentGrid || currentImageFeatures.length === 0 || activeVlmJobId) return;
+  resetVlmProgress(currentCellProcessPlan.processedClusters, currentCellProcessPlan.totalClusters);
+  const progressPercent = currentCellProcessPlan.totalClusters > 0
+    ? (currentCellProcessPlan.processedClusters / currentCellProcessPlan.totalClusters) * 100
+    : 0;
+  const pending = forceVlmCheckbox.checked
+    ? currentCellProcessPlan.representativeImages.length
+    : currentCellProcessPlan.pendingImages.length;
+  const latestUpdatedAt = latestVlmUpdatedAt(vlmResultsByImageId);
+  const latestText = latestUpdatedAt ? `；最后更新 ${formatDate(latestUpdatedAt)}` : "";
+  vlmStatusElement.classList.remove("error");
+  vlmStatusElement.textContent = [
+    `${CELL_PROCESS_DISTANCE_METERS}m位置进度 ${currentCellProcessPlan.processedClusters}/${currentCellProcessPlan.totalClusters} (${progressPercent.toFixed(1)}%)`,
+    `原始点 ${currentImageFeatures.length}`,
+    `近邻冗余 ${currentCellProcessPlan.redundantCount}`,
+    `待自动处理 ${pending}`,
+    `${CELL_PROCESS_DISTANCE_METERS}m内近邻只允许单图手动 Process`,
+    latestText.replace(/^；/, ""),
+  ].filter(Boolean).join("；");
+}
+
+function distanceMeters(firstCoordinates, secondCoordinates) {
+  const lon1 = Number(firstCoordinates[0]);
+  const lat1 = Number(firstCoordinates[1]);
+  const lon2 = Number(secondCoordinates[0]);
+  const lat2 = Number(secondCoordinates[1]);
+  const meanLat = ((lat1 + lat2) / 2) * Math.PI / 180;
+  const metersPerDegreeLat = 111320;
+  const metersPerDegreeLon = Math.cos(meanLat) * 111320;
+  const dx = (lon1 - lon2) * metersPerDegreeLon;
+  const dy = (lat1 - lat2) * metersPerDegreeLat;
+  return Math.sqrt(dx * dx + dy * dy);
+}
+
 async function startCellVlmJob() {
   if (!currentGrid || currentImageFeatures.length === 0 || activeVlmJobId) return;
+  refreshCellProcessPlan();
+  const imagesToProcess = forceVlmCheckbox.checked
+    ? currentCellProcessPlan.representativeImages
+    : currentCellProcessPlan.pendingImages;
+  if (imagesToProcess.length === 0) {
+    updateCellProgressStatus();
+    return;
+  }
   const gridId = currentGrid.properties.grid_id;
   selectedModel = modelSelectElement.value || selectedModel;
-  resetVlmProgress(0, currentImageFeatures.length);
+  resetVlmProgress(currentCellProcessPlan.processedClusters, currentCellProcessPlan.totalClusters);
   processCellVlmButton.disabled = true;
   vlmStatusElement.classList.remove("error");
-  vlmStatusElement.textContent = `正在创建 VLM 任务：${currentImageFeatures.length} 张图像，模型 ${selectedModel || "默认模型"}。`;
+  vlmStatusElement.textContent = `正在加入 VLM 队列：${imagesToProcess.length} 个${CELL_PROCESS_DISTANCE_METERS}m代表点，模型 ${selectedModel || "默认模型"}。`;
 
   try {
     const job = await apiPost(`/api/grids/${encodeURIComponent(gridId)}/vlm-jobs`, {
-      images: currentImageFeatures,
+      images: imagesToProcess,
       model: selectedModel,
       force: forceVlmCheckbox.checked,
     });
     activeVlmJobId = job.job_id;
+    await loadVlmJobs();
     updateVlmJobUi(job);
     pollVlmJob(activeVlmJobId, gridId);
   } catch (error) {
@@ -623,6 +776,7 @@ function pollVlmJob(jobId, gridId) {
         return;
       }
       updateVlmJobUi(job);
+      await loadVlmJobs();
       await loadVlmResults(gridId);
       await loadAllVlmResults();
       if (["completed", "failed"].includes(job.status)) {
@@ -631,6 +785,7 @@ function pollVlmJob(jobId, gridId) {
         await loadVlmResults(gridId);
         await loadAllVlmResults();
         updateProcessButtonState();
+        await loadVlmJobs();
       }
     } catch (error) {
       stopVlmJobPolling();
@@ -643,16 +798,20 @@ function pollVlmJob(jobId, gridId) {
 }
 
 function updateVlmJobUi(job) {
+  refreshCellProcessPlan();
   const total = Number(job.total || 0);
   const processed = Number(job.processed || 0);
-  resetVlmProgress(processed, total);
+  resetVlmProgress(currentCellProcessPlan.processedClusters, currentCellProcessPlan.totalClusters);
+  const progressPercent = currentCellProcessPlan.totalClusters > 0
+    ? (currentCellProcessPlan.processedClusters / currentCellProcessPlan.totalClusters) * 100
+    : 0;
   const current = job.current_image_id ? `；当前 ${job.current_image_id}` : "";
   const analyzed = job.analyzed ? `；新分析 ${job.analyzed}` : "";
   const skipped = job.skipped ? `；跳过已有 ${job.skipped}` : "";
   const failed = job.failed ? `；失败 ${job.failed}` : "";
   const completed = job.completed_at ? `；完成 ${formatDate(job.completed_at)}` : "";
   vlmStatusElement.classList.toggle("error", job.status === "failed");
-  vlmStatusElement.textContent = `VLM ${job.status}：${processed}/${total}${analyzed}${skipped}${failed}${current}${completed}`;
+  vlmStatusElement.textContent = `VLM ${job.status}：任务 ${processed}/${total}${analyzed}${skipped}${failed}${current}${completed}；${CELL_PROCESS_DISTANCE_METERS}m位置进度 ${currentCellProcessPlan.processedClusters}/${currentCellProcessPlan.totalClusters} (${progressPercent.toFixed(1)}%)`;
 }
 
 function resetVlmPanel(message) {
@@ -675,7 +834,15 @@ function stopVlmJobPolling() {
 }
 
 function updateProcessButtonState() {
-  const canProcess = Boolean(currentGrid && ollamaReady && currentImageFeatures.length > 0 && !activeVlmJobId);
+  const canProcess = Boolean(
+    currentGrid
+    && ollamaReady
+    && currentImageFeatures.length > 0
+    && !activeVlmJobId
+    && (forceVlmCheckbox.checked
+      ? currentCellProcessPlan.representativeImages.length > 0
+      : currentCellProcessPlan.pendingImages.length > 0)
+  );
   processCellVlmButton.disabled = !canProcess;
 }
 
@@ -716,27 +883,35 @@ function showImage(feature) {
     ${renderVlmResult(analysis)}
   `;
   document.getElementById("process-current-image-button")?.addEventListener("click", startCurrentImageVlmJob);
+  scrollImageDetailIntoView();
 }
 
 function showStoredVlmPoint(imageId) {
   const analysis = allVlmResultsByImageId[String(imageId)];
   if (!analysis) return;
+  const properties = analysis.image_properties || {};
+  const thumbnail = properties.thumb_1024_url || properties.thumb_256_url
+    ? `<img src="${escapeAttribute(properties.thumb_1024_url || properties.thumb_256_url)}" alt="Mapillary 图像 ${escapeHtml(String(imageId))}">`
+    : '<div class="placeholder"><strong>无缩略图</strong><span>当前缓存里没有该图片 URL。</span></div>';
+  const mapillaryUrl = properties.mapillary_url || `https://www.mapillary.com/app/?pKey=${encodeURIComponent(imageId)}`;
   currentImageFeature = null;
   imageDetailElement.className = "image-detail";
   imageDetailElement.innerHTML = `
-    <div class="placeholder">
-      <strong>已处理图片点</strong>
-      <span>当前未加载该图片的 Mapillary 缩略图。选择对应 cell 并确认访问 Mapillary 后可查看原图。</span>
-    </div>
+    ${thumbnail}
     <h2>图像 ${escapeHtml(String(imageId))}</h2>
     <dl class="metadata">
       <dt>grid_id</dt><dd>${escapeHtml(analysis.grid_id || "null")}</dd>
       <dt>坐标</dt><dd>${escapeHtml(formatCoordinates(analysis.geometry?.coordinates))}</dd>
+      <dt>拍摄时间</dt><dd>${escapeHtml(properties.captured_at ? formatDate(properties.captured_at) : "未知")}</dd>
+      <dt>拍摄方向</dt><dd>${properties.compass_angle == null ? "未知" : `${Number(properties.compass_angle).toFixed(1)}°`}</dd>
+      <dt>相机类型</dt><dd>${escapeHtml(properties.camera_type || "未知")}</dd>
       <dt>主题字段</dt><dd>${escapeHtml(selectedVlmTheme)}</dd>
       <dt>主题值</dt><dd>${escapeHtml(formatVlmValue(analysis, selectedVlmTheme))}</dd>
     </dl>
+    <a class="open-mapillary" href="${escapeAttribute(mapillaryUrl)}" target="_blank" rel="noreferrer">在 Mapillary 街景中打开</a>
     ${renderVlmResult(analysis)}
   `;
+  scrollImageDetailIntoView();
 }
 
 async function startCurrentImageVlmJob() {
@@ -745,7 +920,7 @@ async function startCurrentImageVlmJob() {
   selectedModel = modelSelectElement.value || selectedModel;
   resetVlmProgress(0, 1);
   vlmStatusElement.classList.remove("error");
-  vlmStatusElement.textContent = `正在处理当前图片 ${currentImageFeature.id}，模型 ${selectedModel || "默认模型"}。`;
+  vlmStatusElement.textContent = `正在把当前图片 ${currentImageFeature.id} 加入 VLM 队列，模型 ${selectedModel || "默认模型"}。`;
   updateProcessButtonState();
   const button = document.getElementById("process-current-image-button");
   if (button) button.disabled = true;
@@ -757,6 +932,7 @@ async function startCurrentImageVlmJob() {
       force: true,
     });
     activeVlmJobId = job.job_id;
+    await loadVlmJobs();
     updateVlmJobUi(job);
     pollVlmJob(activeVlmJobId, gridId);
   } catch (error) {
@@ -876,12 +1052,19 @@ function showAwaitingConfirmation() {
   currentImageFeature = null;
   imageDetailElement.className = "image-detail empty";
   imageDetailElement.innerHTML = '<div class="placeholder"><strong>等待确认</strong><span>当前操作尚未访问 Mapillary API。</span></div>';
+  scrollImageDetailIntoView();
 }
 
 function showEmptyImageState() {
   currentImageFeature = null;
   imageDetailElement.className = "image-detail empty";
   imageDetailElement.innerHTML = '<div class="placeholder"><strong>格网内没有图像</strong><span>可选择相邻格网继续检查。</span></div>';
+  scrollImageDetailIntoView();
+}
+
+function scrollImageDetailIntoView() {
+  if (!detailScrollElement) return;
+  detailScrollElement.scrollTop = Math.max(imageDetailElement.offsetTop - 8, 0);
 }
 
 function setError(message) {
@@ -946,10 +1129,15 @@ modelSelectElement.addEventListener("change", () => {
   selectedModel = modelSelectElement.value;
   updateProcessButtonState();
 });
+forceVlmCheckbox.addEventListener("change", () => {
+  refreshCellProcessPlan();
+});
+refreshJobsButton?.addEventListener("click", loadVlmJobs);
 mapillaryGeometryModeSelect.addEventListener("change", () => {
   mapillaryGeometryMode = mapillaryGeometryModeSelect.value === "computed" ? "computed" : "original";
   renderImageLayer();
   renderVlmResultLayer();
+  refreshCellProcessPlan();
   if (currentImageFeature) showImage(currentImageFeature);
 });
 vlmThemeSelect.addEventListener("change", () => {
@@ -970,3 +1158,5 @@ map.on("zoomend", () => {
 checkHealth();
 initializeMainz();
 loadAllVlmResults();
+loadVlmJobs();
+window.setInterval(loadVlmJobs, 5000);

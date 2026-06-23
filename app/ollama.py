@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import base64
+from io import BytesIO
 from dataclasses import dataclass
 import json
 import re
 from typing import Any
 
 import httpx
+from PIL import Image
 
 from app.config import Settings
 
@@ -151,11 +153,13 @@ class OllamaClient:
         properties = image.get("properties", {})
         image_url = _image_url_for_analysis(properties, self.settings.ollama_image_thumb_size)
         geometry = image.get("geometry")
+        image_properties = _stored_image_properties(properties)
         selected_model = model or self.settings.ollama_model
         if not image_url:
             return {
                 "image_id": image_id,
                 "geometry": geometry,
+                "image_properties": image_properties,
                 "ok": False,
                 "model": selected_model,
                 "prompt_version": PROMPT_VERSION,
@@ -165,7 +169,11 @@ class OllamaClient:
         try:
             image_response = await client.get(image_url)
             image_response.raise_for_status()
-            image_base64 = base64.b64encode(image_response.content).decode("ascii")
+            image_bytes = _resize_image_for_analysis(
+                image_response.content,
+                self.settings.ollama_image_thumb_size,
+            )
+            image_base64 = base64.b64encode(image_bytes).decode("ascii")
             payload = {
                 "model": selected_model,
                 "messages": [
@@ -188,6 +196,8 @@ class OllamaClient:
         except (httpx.HTTPError, KeyError, ValueError) as exc:
             return {
                 "image_id": image_id,
+                "geometry": geometry,
+                "image_properties": image_properties,
                 "ok": False,
                 "model": selected_model,
                 "prompt_version": PROMPT_VERSION,
@@ -197,6 +207,7 @@ class OllamaClient:
         return {
             "image_id": image_id,
             "geometry": geometry,
+            "image_properties": image_properties,
             "ok": True,
             "model": selected_model,
             "prompt_version": PROMPT_VERSION,
@@ -217,12 +228,44 @@ def _parse_json_object(content: str) -> dict[str, Any]:
 
 def _image_url_for_analysis(properties: dict[str, Any], preferred_size: int) -> str | None:
     preferred_key = f"thumb_{preferred_size}_url"
-    fallback_keys = [preferred_key, "thumb_256_url", "thumb_1024_url"]
+    fallback_keys = [preferred_key]
+    if preferred_size == 512:
+        fallback_keys.extend(["thumb_1024_url", "thumb_256_url"])
+    else:
+        fallback_keys.extend(["thumb_256_url", "thumb_1024_url"])
     for key in dict.fromkeys(fallback_keys):
         value = properties.get(key)
         if value:
             return str(value)
     return None
+
+
+def _resize_image_for_analysis(content: bytes, max_size: int) -> bytes:
+    if max_size >= 1024:
+        return content
+    with Image.open(BytesIO(content)) as image:
+        image.thumbnail((max_size, max_size))
+        output = BytesIO()
+        image.convert("RGB").save(output, format="JPEG", quality=85, optimize=True)
+        return output.getvalue()
+
+
+def _stored_image_properties(properties: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "captured_at",
+        "camera_type",
+        "height",
+        "width",
+        "thumb_256_url",
+        "thumb_1024_url",
+        "mapillary_url",
+        "compass_angle",
+        "computed_compass_angle",
+        "original_geometry",
+        "computed_geometry",
+        "sequence_id",
+    )
+    return {key: properties.get(key) for key in keys if properties.get(key) is not None}
 
 
 def _normalize_result(data: dict[str, Any]) -> dict[str, Any]:

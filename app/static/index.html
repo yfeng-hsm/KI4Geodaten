@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>KI4Geodaten · Mainz Census 100m 格网</title>
     <link rel="stylesheet" href="/static/vendor/leaflet/leaflet.css">
-    <link rel="stylesheet" href="/static/styles.css?v=20260623-geo1">
+    <link rel="stylesheet" href="/static/styles.css?v=20260623-panel-layout2">
   </head>
   <body>
     <header class="topbar">
@@ -57,13 +57,23 @@
       </section>
 
       <aside class="detail-panel">
-        <div class="summary">
-          <p class="eyebrow">当前格网</p>
-          <div class="metric"><strong id="image-count">0</strong><span>张图像</span></div>
-          <p id="load-status" class="muted">点击格网查看 Census 数据；确认后才会访问 Mapillary。</p>
-          <p id="map-data-status" class="muted">OSM 路网、建筑和土地利用会随选中格网加载。</p>
+        <div class="detail-scroll">
+          <div class="summary">
+            <p class="eyebrow">当前格网</p>
+            <div class="metric"><strong id="image-count">0</strong><span>张图像</span></div>
+            <p id="load-status" class="muted">点击格网查看 Census 数据；确认后才会访问 Mapillary。</p>
+            <p id="map-data-status" class="muted">OSM 路网、建筑和土地利用会随选中格网加载。</p>
+          </div>
+
+          <article id="image-detail" class="image-detail empty">
+            <div class="placeholder">
+              <strong>尚未选择图像</strong>
+              <span>选择格网并确认访问 Mapillary 后，点击绿色图像点查看照片。</span>
+            </div>
+          </article>
+
           <div class="vlm-panel">
-            <button id="process-cell-vlm-button" disabled>Process 当前 cell 全部图像</button>
+            <button id="process-cell-vlm-button" disabled>Process 当前 cell 5m代表点</button>
             <progress id="vlm-progress" value="0" max="1"></progress>
             <p id="vlm-status" class="muted">VLM 尚未处理。先确认访问 Mapillary，再手动处理当前 cell。</p>
             <label class="inline-option">
@@ -83,6 +93,14 @@
               </select>
             </label>
           </div>
+
+          <div class="source-note">
+            地图 © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">OpenStreetMap contributors</a><br>
+            格网规则：© <a href="https://www.bkg.bund.de" target="_blank" rel="noreferrer">GeoBasis-DE / BKG</a>（按 INSPIRE 规则动态生成）<br>
+            街景数据：© <a href="https://www.mapillary.com" target="_blank" rel="noreferrer">Mapillary</a><br>
+            OSM 专题数据：© <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">OpenStreetMap contributors</a>
+          </div>
+
           <dl class="census-data">
             <dt>人口（2022）</dt><dd id="census-population">尚未选择</dd>
             <dt>平均年龄</dt><dd id="census-average-age">—</dd>
@@ -96,23 +114,17 @@
           </dl>
         </div>
 
-        <article id="image-detail" class="image-detail empty">
-          <div class="placeholder">
-            <strong>尚未选择图像</strong>
-            <span>选择格网并确认访问 Mapillary 后，点击绿色图像点查看照片。</span>
+        <div class="queue-panel">
+          <div class="queue-header">
+            <strong>VLM 任务队列</strong>
+            <button id="refresh-vlm-jobs-button" type="button">刷新</button>
           </div>
-        </article>
-
-        <div class="source-note">
-          地图 © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">OpenStreetMap contributors</a><br>
-          格网规则：© <a href="https://www.bkg.bund.de" target="_blank" rel="noreferrer">GeoBasis-DE / BKG</a>（按 INSPIRE 规则动态生成）<br>
-          街景数据：© <a href="https://www.mapillary.com" target="_blank" rel="noreferrer">Mapillary</a><br>
-          OSM 专题数据：© <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">OpenStreetMap contributors</a>
+          <div id="vlm-jobs" class="job-list muted">正在读取任务队列…</div>
         </div>
       </aside>
     </main>
 
     <script src="/static/vendor/leaflet/leaflet.js"></script>
-    <script src="/static/app.js?v=20260623-geo1"></script>
+    <script src="/static/app.js?v=20260623-panel-layout2"></script>
   </body>
 </html>

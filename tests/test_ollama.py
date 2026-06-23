@@ -43,3 +43,12 @@ def test_image_url_for_analysis_falls_back_to_1024():
     properties = {"thumb_1024_url": "https://example.test/1024.jpg"}
 
     assert _image_url_for_analysis(properties, 256).endswith("/1024.jpg")
+
+
+def test_image_url_for_analysis_uses_1024_for_local_512_resize():
+    properties = {
+        "thumb_256_url": "https://example.test/256.jpg",
+        "thumb_1024_url": "https://example.test/1024.jpg",
+    }
+
+    assert _image_url_for_analysis(properties, 512).endswith("/1024.jpg")

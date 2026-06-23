@@ -21,7 +21,7 @@ def settings(tmp_path: Path, token: str | None = None) -> Settings:
         ollama_model="gemma4:31b",
         ollama_timeout_seconds=180,
         ollama_max_images_per_request=20,
-        ollama_image_thumb_size=256,
+        ollama_image_thumb_size=512,
     )
 
 

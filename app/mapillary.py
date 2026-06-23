@@ -130,6 +130,21 @@ class MapillaryClient:
             temporary = Path(handle.name)
         temporary.replace(destination)
 
+    def cached_image_index(self) -> dict[str, dict[str, Any]]:
+        if not self.settings.cache_dir.exists():
+            return {}
+        index = {}
+        for path in self.settings.cache_dir.glob("*.geojson"):
+            try:
+                collection = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            for feature in collection.get("features", []):
+                image_id = str(feature.get("id") or feature.get("properties", {}).get("id") or "")
+                if image_id:
+                    index[image_id] = feature
+        return index
+
 
 def _normalize_image(raw: dict) -> dict:
     original_geometry = raw.get("geometry")

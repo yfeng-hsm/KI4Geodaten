@@ -45,5 +45,5 @@ class Settings:
 
 
 def _ollama_image_thumb_size() -> int:
-    value = int(os.getenv("OLLAMA_IMAGE_THUMB_SIZE", "256"))
-    return value if value in {256, 1024} else 256
+    value = int(os.getenv("OLLAMA_IMAGE_THUMB_SIZE", "512"))
+    return value if value in {256, 512, 1024} else 512

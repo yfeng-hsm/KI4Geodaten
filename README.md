@@ -77,12 +77,12 @@ Overpass 原始响应缓存到 Docker 卷中的 `/app/data/cache/osm_mainz_overp
 ```bash
 OLLAMA_BASE_URL=http://100.87.51.96:11434
 OLLAMA_MODEL=gemma4:31b
-OLLAMA_IMAGE_THUMB_SIZE=256
+OLLAMA_IMAGE_THUMB_SIZE=512
 ```
 
 右上角状态会分别显示 Mapillary 配置状态和 Docker 容器内 Ollama 连通状态。模型下拉框来自 Ollama `/api/tags`。VLM 不会自动分析；需要先选择 cell、确认访问 Mapillary，然后点击右侧 Process 按钮处理当前 cell 的全部图像。
 
-VLM 默认使用 Mapillary `thumb_256_url`，明显减少图片下载、base64 编码和模型视觉输入耗时。前端预览仍使用 `thumb_1024_url`。如果后续字段需要更细的远处设施识别，可以在 `.env` 中把 `OLLAMA_IMAGE_THUMB_SIZE` 改为 `1024` 后重建容器。
+VLM 默认使用最大 512px 图像输入：后端优先下载 Mapillary `thumb_1024_url` 并在容器内缩放到 512px，再发给 Ollama。前端预览仍使用 `thumb_1024_url`。如果后续字段需要更细的远处设施识别，可以在 `.env` 中把 `OLLAMA_IMAGE_THUMB_SIZE` 改为 `1024` 后重建容器；如果需要更快但更粗略，可改为 `256`。
 
 分析结果逐张写入 PostGIS 表 `vlm_image_analysis`，不会等整个 cell 完成后才保存。PostGIS 使用 Docker volume `postgres-data`，因此容器重启后结果仍保留。cell 批处理默认跳过已经存在的 `image_id`，避免重复消耗模型；勾选“覆盖已有 VLM 结果”后才会重新处理并覆盖当前 cell。每张图片详情中的单图 Process 会覆盖该图片旧结果。
 
@@ -133,7 +133,13 @@ docker compose run --rm app pytest
 - `GET /api/vlm-results`
 - `GET /api/grids/{grid_id}/vlm-results`
 - `POST /api/grids/{grid_id}/vlm-jobs`
+- `GET /api/vlm/jobs`
 - `GET /api/vlm/jobs/{job_id}`
+
+VLM 分析结果写入 PostgreSQL 表 `vlm_image_analysis`。任务队列写入 PostgreSQL 表
+`vlm_processing_jobs` 和 `vlm_processing_job_items`，容器重启后仍可查看最近任务，
+处于 `running` 的任务会回到 `queued` 等待继续处理。Mapillary GeoJSON 文件缓存只用于避免重复访问
+Mapillary API，不保存 VLM 标注结果。
 
 交互式 API 文档位于 [http://localhost:8000/docs](http://localhost:8000/docs)。
 

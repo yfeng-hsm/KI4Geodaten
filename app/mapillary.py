@@ -14,6 +14,7 @@ from app.grid import CensusGridCell
 
 
 MAPILLARY_IMAGES_URL = "https://graph.mapillary.com/images"
+MAPILLARY_CACHE_SCHEMA_VERSION = 3
 IMAGE_FIELDS = ",".join(
     [
         "id",
@@ -25,6 +26,7 @@ IMAGE_FIELDS = ",".join(
         "camera_type",
         "height",
         "width",
+        "thumb_256_url",
         "thumb_1024_url",
         "sequence",
     ]
@@ -91,6 +93,7 @@ class MapillaryClient:
                 "cache": "miss",
                 "truncated": len(body.get("data", []))
                 >= self.settings.max_images_per_grid,
+                "mapillary_cache_schema_version": MAPILLARY_CACHE_SCHEMA_VERSION,
             },
         }
         await asyncio.to_thread(self._write_cache, cell, result)
@@ -107,9 +110,12 @@ class MapillaryClient:
         if age > self.settings.cache_ttl_seconds:
             return None
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
+            cached = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return None
+        if cached.get("meta", {}).get("mapillary_cache_schema_version") != MAPILLARY_CACHE_SCHEMA_VERSION:
+            return None
+        return cached
 
     def _write_cache(self, cell: CensusGridCell, result: dict) -> None:
         self.settings.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -126,8 +132,13 @@ class MapillaryClient:
 
 
 def _normalize_image(raw: dict) -> dict:
-    geometry = raw.get("computed_geometry") or raw.get("geometry")
+    original_geometry = raw.get("geometry")
+    computed_geometry = raw.get("computed_geometry")
+    geometry = original_geometry or computed_geometry
     properties = {key: value for key, value in raw.items() if key not in {"geometry", "computed_geometry"}}
+    properties["original_geometry"] = original_geometry
+    properties["computed_geometry"] = computed_geometry
+    properties["geometry_source"] = "original" if original_geometry else "computed"
     sequence = properties.get("sequence")
     if isinstance(sequence, dict):
         properties["sequence_id"] = sequence.get("id")

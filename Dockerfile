@@ -24,6 +24,7 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && if [ "$INSTALL_DEV" = "true" ]; then pip install --no-cache-dir -r requirements-dev.txt; fi
 
 COPY app ./app
+COPY scripts ./scripts
 COPY tests ./tests
 COPY pytest.ini ./
 COPY --from=frontend-assets /assets/node_modules/leaflet/dist ./app/static/vendor/leaflet

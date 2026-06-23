@@ -11,10 +11,18 @@ class Settings:
     cache_dir: Path
     cache_ttl_seconds: int
     max_images_per_grid: int
+    database_url: str | None
+    ollama_base_url: str | None
+    ollama_model: str
+    ollama_timeout_seconds: int
+    ollama_max_images_per_request: int
+    ollama_image_thumb_size: int
 
     @classmethod
     def from_env(cls) -> "Settings":
         token = os.getenv("MAPILLARY_ACCESS_TOKEN", "").strip() or None
+        database_url = os.getenv("DATABASE_URL", "").strip() or None
+        ollama_base_url = os.getenv("OLLAMA_BASE_URL", "").strip().rstrip("/") or None
         return cls(
             mapillary_access_token=token,
             cache_dir=Path(os.getenv("MAPILLARY_CACHE_DIR", "data/cache")),
@@ -25,4 +33,17 @@ class Settings:
                 int(os.getenv("MAPILLARY_MAX_IMAGES_PER_GRID", "2000")),
                 2000,
             ),
+            database_url=database_url,
+            ollama_base_url=ollama_base_url,
+            ollama_model=os.getenv("OLLAMA_MODEL", "gemma4:31b").strip(),
+            ollama_timeout_seconds=int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "180")),
+            ollama_max_images_per_request=max(
+                1, int(os.getenv("OLLAMA_MAX_IMAGES_PER_REQUEST", "20"))
+            ),
+            ollama_image_thumb_size=_ollama_image_thumb_size(),
         )
+
+
+def _ollama_image_thumb_size() -> int:
+    value = int(os.getenv("OLLAMA_IMAGE_THUMB_SIZE", "256"))
+    return value if value in {256, 1024} else 256

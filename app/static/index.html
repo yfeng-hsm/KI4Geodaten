@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>KI4Geodaten · Mainz Census 100m 格网</title>
+    <link rel="stylesheet" href="/static/vendor/leaflet/leaflet.css">
+    <link rel="stylesheet" href="/static/styles.css?v=20260623-geo1">
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">KI4Geodaten</p>
+        <h1>Mainz · Census 100m 格网与 Mapillary</h1>
+      </div>
+      <div class="service-status">
+        <div class="health" id="mapillary-health">Mapillary 检查中…</div>
+        <label class="model-picker">
+          <span id="model-health">模型检查中…</span>
+          <select id="model-select" disabled>
+            <option value="">未连接</option>
+          </select>
+        </label>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <section class="map-panel">
+        <div class="map-toolbar">
+          <div>
+            <strong id="grid-id">正在加载 Mainz 全城 100m 格网…</strong>
+            <span id="grid-coordinates">Zensus 2022 · ETRS89-LAEA · EPSG:3035</span>
+          </div>
+          <div class="actions">
+            <label class="toolbar-select">
+              <span>Mapillary 位置</span>
+              <select id="mapillary-geometry-mode">
+                <option value="original">原始 GPS</option>
+                <option value="computed">Mapillary 校正</option>
+              </select>
+            </label>
+            <button id="confirm-mapillary-button" disabled>确认访问 Mapillary</button>
+            <a id="download-link" class="button-link disabled" href="#">下载 GeoJSON</a>
+          </div>
+        </div>
+        <div id="map" aria-label="OSM 底图、Census 格网和 Mapillary 图像点"></div>
+        <div class="legend">
+          <span><i class="swatch grid"></i>Census 100m vector layer</span>
+          <span><i class="swatch selected"></i>选中格网</span>
+          <span><i class="swatch road vehicle"></i>车行道路</span>
+          <span><i class="swatch road pedestrian"></i>行人道路</span>
+          <span><i class="swatch road bicycle"></i>自行车路</span>
+          <span><i class="swatch building"></i>OSM 建筑</span>
+          <span><i class="swatch landuse"></i>土地利用</span>
+          <span><i class="swatch image"></i>Mapillary 图像</span>
+        </div>
+      </section>
+
+      <aside class="detail-panel">
+        <div class="summary">
+          <p class="eyebrow">当前格网</p>
+          <div class="metric"><strong id="image-count">0</strong><span>张图像</span></div>
+          <p id="load-status" class="muted">点击格网查看 Census 数据；确认后才会访问 Mapillary。</p>
+          <p id="map-data-status" class="muted">OSM 路网、建筑和土地利用会随选中格网加载。</p>
+          <div class="vlm-panel">
+            <button id="process-cell-vlm-button" disabled>Process 当前 cell 全部图像</button>
+            <progress id="vlm-progress" value="0" max="1"></progress>
+            <p id="vlm-status" class="muted">VLM 尚未处理。先确认访问 Mapillary，再手动处理当前 cell。</p>
+            <label class="inline-option">
+              <input id="force-vlm-checkbox" type="checkbox">
+              覆盖已有 VLM 结果
+            </label>
+            <label class="field-picker">
+              <span>结果图层主题</span>
+              <select id="vlm-theme-select">
+                <option value="capture_position">capture_position</option>
+                <option value="surface_material">surface_material</option>
+                <option value="traffic_signal">traffic_signal</option>
+                <option value="bench">bench</option>
+                <option value="waste_basket">waste_basket</option>
+                <option value="independent_bicycle_road">independent_bicycle_road</option>
+                <option value="independent_pedestrian_road">independent_pedestrian_road</option>
+              </select>
+            </label>
+          </div>
+          <dl class="census-data">
+            <dt>人口（2022）</dt><dd id="census-population">尚未选择</dd>
+            <dt>平均年龄</dt><dd id="census-average-age">—</dd>
+            <dt>外国人比例</dt><dd id="census-foreigners">—</dd>
+            <dt>18岁以下</dt><dd id="census-under-18">—</dd>
+            <dt>65岁以上</dt><dd id="census-over-65">—</dd>
+            <dt>平均家庭规模</dt><dd id="census-household-size">—</dd>
+            <dt>数据说明</dt><dd id="census-quality-flags">—</dd>
+            <dt>Mainz 面积占比</dt><dd id="census-city-share">—</dd>
+            <dt>格网 ID</dt><dd id="census-grid-id">—</dd>
+          </dl>
+        </div>
+
+        <article id="image-detail" class="image-detail empty">
+          <div class="placeholder">
+            <strong>尚未选择图像</strong>
+            <span>选择格网并确认访问 Mapillary 后，点击绿色图像点查看照片。</span>
+          </div>
+        </article>
+
+        <div class="source-note">
+          地图 © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">OpenStreetMap contributors</a><br>
+          格网规则：© <a href="https://www.bkg.bund.de" target="_blank" rel="noreferrer">GeoBasis-DE / BKG</a>（按 INSPIRE 规则动态生成）<br>
+          街景数据：© <a href="https://www.mapillary.com" target="_blank" rel="noreferrer">Mapillary</a><br>
+          OSM 专题数据：© <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">OpenStreetMap contributors</a>
+        </div>
+      </aside>
+    </main>
+
+    <script src="/static/vendor/leaflet/leaflet.js"></script>
+    <script src="/static/app.js?v=20260623-geo1"></script>
+  </body>
+</html>

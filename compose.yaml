@@ -1,0 +1,44 @@
+services:
+  db:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-ki4geodaten}
+      POSTGRES_USER: ${POSTGRES_USER:-ki4geodaten}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ki4geodaten}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  app:
+    build:
+      context: .
+      args:
+        INSTALL_DEV: "true"
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://ki4geodaten:ki4geodaten@db:5432/ki4geodaten}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://100.87.51.96:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:31b}
+      OLLAMA_TIMEOUT_SECONDS: ${OLLAMA_TIMEOUT_SECONDS:-180}
+      OLLAMA_MAX_IMAGES_PER_REQUEST: ${OLLAMA_MAX_IMAGES_PER_REQUEST:-20}
+      OLLAMA_IMAGE_THUMB_SIZE: ${OLLAMA_IMAGE_THUMB_SIZE:-256}
+      MAPILLARY_ACCESS_TOKEN: ${MAPILLARY_ACCESS_TOKEN:-}
+      MAPILLARY_CACHE_DIR: /app/data/cache
+      MAPILLARY_CACHE_TTL_SECONDS: ${MAPILLARY_CACHE_TTL_SECONDS:-86400}
+      MAPILLARY_MAX_IMAGES_PER_GRID: ${MAPILLARY_MAX_IMAGES_PER_GRID:-2000}
+    volumes:
+      - mapillary-cache:/app/data/cache
+
+volumes:
+  mapillary-cache:
+  postgres-data:

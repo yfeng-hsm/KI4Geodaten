@@ -242,8 +242,10 @@ const mapillaryHealthElement = document.getElementById("mapillary-health");
 const modelHealthElement = document.getElementById("model-health");
 const modelSelectElement = document.getElementById("model-select");
 const detailScrollElement = document.querySelector(".detail-scroll");
+const themePanelElement = document.querySelector(".theme-panel");
 const imageDetailElement = document.getElementById("image-detail");
 const processCellVlmButton = document.getElementById("process-cell-vlm-button");
+const processCurrentImageButton = document.getElementById("process-current-image-button");
 const vlmProgressElement = document.getElementById("vlm-progress");
 const vlmStatusElement = document.getElementById("vlm-status");
 const forceVlmCheckbox = document.getElementById("force-vlm-checkbox");
@@ -834,7 +836,11 @@ function stopVlmJobPolling() {
 }
 
 function updateProcessButtonState() {
-  const canProcess = Boolean(
+  const hasSelectedImage = Boolean(currentImageFeature);
+  processCellVlmButton.hidden = hasSelectedImage;
+  processCurrentImageButton.hidden = !hasSelectedImage;
+
+  const canProcessCell = Boolean(
     currentGrid
     && ollamaReady
     && currentImageFeatures.length > 0
@@ -843,7 +849,14 @@ function updateProcessButtonState() {
       ? currentCellProcessPlan.representativeImages.length > 0
       : currentCellProcessPlan.pendingImages.length > 0)
   );
-  processCellVlmButton.disabled = !canProcess;
+  const canProcessImage = Boolean(
+    currentGrid
+    && currentImageFeature
+    && ollamaReady
+    && !activeVlmJobId
+  );
+  processCellVlmButton.disabled = !canProcessCell;
+  processCurrentImageButton.disabled = !canProcessImage;
 }
 
 function showImage(feature) {
@@ -879,10 +892,9 @@ function showImage(feature) {
       <dt>序列 ID</dt><dd>${escapeHtml(String(properties.sequence_id || "未知"))}</dd>
     </dl>
     <a class="open-mapillary" href="${escapeAttribute(properties.mapillary_url)}" target="_blank" rel="noreferrer">在 Mapillary 街景中打开</a>
-    <button id="process-current-image-button" class="vlm-action" ${ollamaReady && !activeVlmJobId ? "" : "disabled"}>Process 当前图片</button>
     ${renderVlmResult(analysis)}
   `;
-  document.getElementById("process-current-image-button")?.addEventListener("click", startCurrentImageVlmJob);
+  updateProcessButtonState();
   scrollImageDetailIntoView();
 }
 
@@ -911,6 +923,7 @@ function showStoredVlmPoint(imageId) {
     <a class="open-mapillary" href="${escapeAttribute(mapillaryUrl)}" target="_blank" rel="noreferrer">在 Mapillary 街景中打开</a>
     ${renderVlmResult(analysis)}
   `;
+  updateProcessButtonState();
   scrollImageDetailIntoView();
 }
 
@@ -922,8 +935,7 @@ async function startCurrentImageVlmJob() {
   vlmStatusElement.classList.remove("error");
   vlmStatusElement.textContent = `正在把当前图片 ${currentImageFeature.id} 加入 VLM 队列，模型 ${selectedModel || "默认模型"}。`;
   updateProcessButtonState();
-  const button = document.getElementById("process-current-image-button");
-  if (button) button.disabled = true;
+  processCurrentImageButton.disabled = true;
 
   try {
     const job = await apiPost(`/api/grids/${encodeURIComponent(gridId)}/vlm-jobs`, {
@@ -940,7 +952,7 @@ async function startCurrentImageVlmJob() {
     vlmStatusElement.textContent = `当前图片 VLM 任务创建失败：${error.message}`;
     vlmStatusElement.classList.add("error");
     updateProcessButtonState();
-    if (button) button.disabled = false;
+    processCurrentImageButton.disabled = false;
   }
 }
 
@@ -1052,6 +1064,7 @@ function showAwaitingConfirmation() {
   currentImageFeature = null;
   imageDetailElement.className = "image-detail empty";
   imageDetailElement.innerHTML = '<div class="placeholder"><strong>等待确认</strong><span>当前操作尚未访问 Mapillary API。</span></div>';
+  updateProcessButtonState();
   scrollImageDetailIntoView();
 }
 
@@ -1059,12 +1072,14 @@ function showEmptyImageState() {
   currentImageFeature = null;
   imageDetailElement.className = "image-detail empty";
   imageDetailElement.innerHTML = '<div class="placeholder"><strong>格网内没有图像</strong><span>可选择相邻格网继续检查。</span></div>';
+  updateProcessButtonState();
   scrollImageDetailIntoView();
 }
 
 function scrollImageDetailIntoView() {
   if (!detailScrollElement) return;
-  detailScrollElement.scrollTop = Math.max(imageDetailElement.offsetTop - 8, 0);
+  const stickyOffset = themePanelElement ? themePanelElement.offsetHeight : 0;
+  detailScrollElement.scrollTop = Math.max(imageDetailElement.offsetTop - stickyOffset - 8, 0);
 }
 
 function setError(message) {
@@ -1125,6 +1140,7 @@ function escapeAttribute(value) {
 
 confirmMapillaryButton.addEventListener("click", loadImages);
 processCellVlmButton.addEventListener("click", startCellVlmJob);
+processCurrentImageButton.addEventListener("click", startCurrentImageVlmJob);
 modelSelectElement.addEventListener("change", () => {
   selectedModel = modelSelectElement.value;
   updateProcessButtonState();

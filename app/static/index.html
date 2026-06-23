@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>KI4Geodaten · Mainz Census 100m 格网</title>
     <link rel="stylesheet" href="/static/vendor/leaflet/leaflet.css">
-    <link rel="stylesheet" href="/static/styles.css?v=20260623-panel-layout2">
+    <link rel="stylesheet" href="/static/styles.css?v=20260623-sidebar-flow2">
   </head>
   <body>
     <header class="topbar">
@@ -58,6 +58,19 @@
 
       <aside class="detail-panel">
         <div class="detail-scroll">
+          <label class="field-picker theme-panel">
+            <span>结果图层主题</span>
+            <select id="vlm-theme-select">
+              <option value="capture_position">capture_position</option>
+              <option value="surface_material">surface_material</option>
+              <option value="traffic_signal">traffic_signal</option>
+              <option value="bench">bench</option>
+              <option value="waste_basket">waste_basket</option>
+              <option value="independent_bicycle_road">independent_bicycle_road</option>
+              <option value="independent_pedestrian_road">independent_pedestrian_road</option>
+            </select>
+          </label>
+
           <div class="summary">
             <p class="eyebrow">当前格网</p>
             <div class="metric"><strong id="image-count">0</strong><span>张图像</span></div>
@@ -74,31 +87,13 @@
 
           <div class="vlm-panel">
             <button id="process-cell-vlm-button" disabled>Process 当前 cell 5m代表点</button>
+            <button id="process-current-image-button" hidden disabled>Process 当前图片</button>
             <progress id="vlm-progress" value="0" max="1"></progress>
             <p id="vlm-status" class="muted">VLM 尚未处理。先确认访问 Mapillary，再手动处理当前 cell。</p>
             <label class="inline-option">
               <input id="force-vlm-checkbox" type="checkbox">
               覆盖已有 VLM 结果
             </label>
-            <label class="field-picker">
-              <span>结果图层主题</span>
-              <select id="vlm-theme-select">
-                <option value="capture_position">capture_position</option>
-                <option value="surface_material">surface_material</option>
-                <option value="traffic_signal">traffic_signal</option>
-                <option value="bench">bench</option>
-                <option value="waste_basket">waste_basket</option>
-                <option value="independent_bicycle_road">independent_bicycle_road</option>
-                <option value="independent_pedestrian_road">independent_pedestrian_road</option>
-              </select>
-            </label>
-          </div>
-
-          <div class="source-note">
-            地图 © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">OpenStreetMap contributors</a><br>
-            格网规则：© <a href="https://www.bkg.bund.de" target="_blank" rel="noreferrer">GeoBasis-DE / BKG</a>（按 INSPIRE 规则动态生成）<br>
-            街景数据：© <a href="https://www.mapillary.com" target="_blank" rel="noreferrer">Mapillary</a><br>
-            OSM 专题数据：© <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">OpenStreetMap contributors</a>
           </div>
 
           <dl class="census-data">
@@ -112,19 +107,26 @@
             <dt>Mainz 面积占比</dt><dd id="census-city-share">—</dd>
             <dt>格网 ID</dt><dd id="census-grid-id">—</dd>
           </dl>
-        </div>
 
-        <div class="queue-panel">
-          <div class="queue-header">
-            <strong>VLM 任务队列</strong>
-            <button id="refresh-vlm-jobs-button" type="button">刷新</button>
+          <div class="queue-panel">
+            <div class="queue-header">
+              <strong>VLM 任务队列</strong>
+              <button id="refresh-vlm-jobs-button" type="button">刷新</button>
+            </div>
+            <div id="vlm-jobs" class="job-list muted">正在读取任务队列…</div>
           </div>
-          <div id="vlm-jobs" class="job-list muted">正在读取任务队列…</div>
+
+          <div class="source-note">
+            地图 © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">OpenStreetMap contributors</a><br>
+            格网规则：© <a href="https://www.bkg.bund.de" target="_blank" rel="noreferrer">GeoBasis-DE / BKG</a>（按 INSPIRE 规则动态生成）<br>
+            街景数据：© <a href="https://www.mapillary.com" target="_blank" rel="noreferrer">Mapillary</a><br>
+            OSM 专题数据：© <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">OpenStreetMap contributors</a>
+          </div>
         </div>
       </aside>
     </main>
 
     <script src="/static/vendor/leaflet/leaflet.js"></script>
-    <script src="/static/app.js?v=20260623-panel-layout2"></script>
+    <script src="/static/app.js?v=20260623-sidebar-flow2"></script>
   </body>
 </html>

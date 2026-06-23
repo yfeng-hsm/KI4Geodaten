@@ -130,6 +130,7 @@ docker compose run --rm app pytest
 - `GET /api/grids/{grid_id}/images?refresh=true`
 - `GET /api/grids/{grid_id}/images.geojson`
 - `POST /api/vlm/analyze-image`
+- `GET /api/vlm-results`
 - `GET /api/grids/{grid_id}/vlm-results`
 - `POST /api/grids/{grid_id}/vlm-jobs`
 - `GET /api/vlm/jobs/{job_id}`

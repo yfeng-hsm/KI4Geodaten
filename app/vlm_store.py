@@ -128,6 +128,29 @@ class VLMAnalysisStore:
             "results": results,
         }
 
+    def all_results(self, limit: int = 5000) -> dict[str, Any]:
+        if not self.database_url:
+            return {"available": False, "results": {}}
+        self.ensure_schema()
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT image_id, grid_id, model, prompt_version, geometry, fields, error, updated_at
+                FROM vlm_image_analysis
+                WHERE geometry IS NOT NULL
+                ORDER BY updated_at DESC
+                LIMIT %s
+                """,
+                (limit,),
+            ).fetchall()
+        results = {row["image_id"]: self._format_row(row) for row in rows}
+        return {
+            "available": True,
+            "count": len(results),
+            "limit": limit,
+            "results": results,
+        }
+
     def _connect(self) -> psycopg.Connection:
         assert self.database_url is not None
         return psycopg.connect(self.database_url, row_factory=dict_row, connect_timeout=3)

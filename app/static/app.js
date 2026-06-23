@@ -43,15 +43,18 @@ const buildingRenderer = L.canvas({ pane: "buildingPane", padding: 0.4 });
 const pedestrianRoadRenderer = L.canvas({ pane: "pedestrianRoadPane", padding: 0.4 });
 const vehicleRoadRenderer = L.canvas({ pane: "vehicleRoadPane", padding: 0.4 });
 const bicycleRoadRenderer = L.canvas({ pane: "bicycleRoadPane", padding: 0.4 });
+const vlmResultRenderer = L.svg({ pane: "vlmResultPane", padding: 0.4 });
 let selectedGridLayer = null;
 let currentGrid = null;
 let currentImageFeature = null;
 let currentImageFeatures = [];
 let vlmResultsByImageId = {};
+let allVlmResultsByImageId = {};
 let mapillaryGeometryMode = "original";
 let requestSequence = 0;
 let cellMapSequence = 0;
 let vlmResultsSequence = 0;
+let allVlmResultsSequence = 0;
 let activeVlmJobId = null;
 let vlmJobTimer = null;
 let ollamaReady = false;
@@ -126,7 +129,12 @@ const imageLayer = L.geoJSON(null, {
       title: `拍摄方向 ${Number.isFinite(angle) ? angle.toFixed(1) : "0.0"}°`,
     });
   },
-  onEachFeature: (feature, layer) => layer.on("click", () => showImage(feature)),
+  onEachFeature: (feature, layer) => {
+    layer.on("click", (event) => {
+      L.DomEvent.stopPropagation(event);
+      showImage(feature);
+    });
+  },
 }).addTo(map);
 
 const vlmResultLayer = L.geoJSON(null, {
@@ -140,11 +148,17 @@ const vlmResultLayer = L.geoJSON(null, {
     fillOpacity: 0.9,
     className: "vlm-result-point",
     interactive: true,
+    renderer: vlmResultRenderer,
   }),
   onEachFeature: (feature, layer) => {
-    layer.on("click", () => {
+    layer.on("click", (event) => {
+      L.DomEvent.stopPropagation(event);
       const sourceFeature = currentImageFeatures.find((item) => String(item.id) === feature.properties.image_id);
-      if (sourceFeature) showImage(sourceFeature);
+      if (sourceFeature) {
+        showImage(sourceFeature);
+      } else {
+        showStoredVlmPoint(feature.properties.image_id);
+      }
     });
     layer.bindTooltip(
       `${feature.properties.image_id}<br>${selectedVlmTheme}: ${feature.properties.theme_value}`,
@@ -365,7 +379,6 @@ function selectGrid(feature, layer) {
   censusCityShareElement.textContent = `${(properties.city_area_share * 100).toFixed(1)}%`;
 
   imageLayer.clearLayers();
-  vlmResultLayer.clearLayers();
   currentImageFeature = null;
   currentImageFeatures = [];
   vlmResultsByImageId = {};
@@ -527,6 +540,7 @@ async function loadVlmResults(gridId) {
     const result = await apiGet(`/api/grids/${encodeURIComponent(gridId)}/vlm-results`);
     if (sequence !== vlmResultsSequence || !currentGrid || currentGrid.properties.grid_id !== gridId) return;
     vlmResultsByImageId = result.results || {};
+    Object.assign(allVlmResultsByImageId, vlmResultsByImageId);
     const count = result.count || 0;
     const latestUpdatedAt = latestVlmUpdatedAt(vlmResultsByImageId);
     const latestText = latestUpdatedAt ? `；最后更新 ${formatDate(latestUpdatedAt)}` : "；最后更新 null";
@@ -543,6 +557,34 @@ async function loadVlmResults(gridId) {
     vlmStatusElement.textContent = `VLM 结果读取失败：${error.message}`;
     vlmStatusElement.classList.add("error");
   }
+}
+
+async function loadAllVlmResults() {
+  const sequence = ++allVlmResultsSequence;
+  try {
+    const result = await apiGet("/api/vlm-results?limit=50000");
+    if (sequence !== allVlmResultsSequence) return;
+    allVlmResultsByImageId = result.results || {};
+    renderVlmResultLayer();
+    updateGlobalVlmStatus(result.count || 0);
+  } catch (error) {
+    if (sequence !== allVlmResultsSequence) return;
+    vlmStatusElement.textContent = `全局 VLM 结果读取失败：${error.message}`;
+    vlmStatusElement.classList.add("error");
+  }
+}
+
+function updateGlobalVlmStatus(totalProcessed) {
+  if (activeVlmJobId) return;
+  if (!currentGrid) {
+    vlmStatusElement.textContent = `数据库已有 ${totalProcessed} 张已处理图片。选择 cell 后可继续处理。`;
+    return;
+  }
+  if (currentImageFeatures.length === 0) return;
+  const currentCount = Object.keys(vlmResultsByImageId).length;
+  const latestUpdatedAt = latestVlmUpdatedAt(vlmResultsByImageId);
+  const latestText = latestUpdatedAt ? `；当前 cell 最后更新 ${formatDate(latestUpdatedAt)}` : "";
+  vlmStatusElement.textContent = `数据库已有 ${totalProcessed} 张已处理图片；当前 cell ${currentCount} 张${latestText}。`;
 }
 
 async function startCellVlmJob() {
@@ -582,10 +624,12 @@ function pollVlmJob(jobId, gridId) {
       }
       updateVlmJobUi(job);
       await loadVlmResults(gridId);
+      await loadAllVlmResults();
       if (["completed", "failed"].includes(job.status)) {
         stopVlmJobPolling();
         activeVlmJobId = null;
         await loadVlmResults(gridId);
+        await loadAllVlmResults();
         updateProcessButtonState();
       }
     } catch (error) {
@@ -672,6 +716,27 @@ function showImage(feature) {
     ${renderVlmResult(analysis)}
   `;
   document.getElementById("process-current-image-button")?.addEventListener("click", startCurrentImageVlmJob);
+}
+
+function showStoredVlmPoint(imageId) {
+  const analysis = allVlmResultsByImageId[String(imageId)];
+  if (!analysis) return;
+  currentImageFeature = null;
+  imageDetailElement.className = "image-detail";
+  imageDetailElement.innerHTML = `
+    <div class="placeholder">
+      <strong>已处理图片点</strong>
+      <span>当前未加载该图片的 Mapillary 缩略图。选择对应 cell 并确认访问 Mapillary 后可查看原图。</span>
+    </div>
+    <h2>图像 ${escapeHtml(String(imageId))}</h2>
+    <dl class="metadata">
+      <dt>grid_id</dt><dd>${escapeHtml(analysis.grid_id || "null")}</dd>
+      <dt>坐标</dt><dd>${escapeHtml(formatCoordinates(analysis.geometry?.coordinates))}</dd>
+      <dt>主题字段</dt><dd>${escapeHtml(selectedVlmTheme)}</dd>
+      <dt>主题值</dt><dd>${escapeHtml(formatVlmValue(analysis, selectedVlmTheme))}</dd>
+    </dl>
+    ${renderVlmResult(analysis)}
+  `;
 }
 
 async function startCurrentImageVlmJob() {
@@ -769,7 +834,7 @@ function formatCoordinates(coordinates) {
 function renderVlmResultLayer() {
   vlmResultLayer.clearLayers();
   const imageFeatureById = new Map(currentImageFeatures.map((feature) => [String(feature.id), feature]));
-  const features = Object.values(vlmResultsByImageId).flatMap((analysis) => {
+  const features = Object.values(allVlmResultsByImageId).flatMap((analysis) => {
     const imageFeature = imageFeatureById.get(String(analysis.image_id));
     const geometry = imageFeature ? displayGeometry(imageFeature) : analysis.geometry;
     if (!geometry) return [];
@@ -904,3 +969,4 @@ map.on("zoomend", () => {
 });
 checkHealth();
 initializeMainz();
+loadAllVlmResults();

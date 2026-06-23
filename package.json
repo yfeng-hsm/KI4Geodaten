@@ -1,0 +1,8 @@
+{
+  "name": "ki4geodaten-frontend-assets",
+  "private": true,
+  "version": "0.1.0",
+  "dependencies": {
+    "leaflet": "1.9.4"
+  }
+}

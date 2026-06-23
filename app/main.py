@@ -146,6 +146,14 @@ async def vlm_results_for_grid(grid_id: str, request: Request) -> dict:
     return request.app.state.vlm_store.results_for_grid(grid_id)
 
 
+@app.get("/api/vlm-results")
+async def all_vlm_results(
+    request: Request,
+    limit: int = Query(default=5000, ge=1, le=50000),
+) -> dict:
+    return request.app.state.vlm_store.all_results(limit=limit)
+
+
 @app.post("/api/grids/{grid_id}/vlm-jobs")
 async def start_vlm_job(grid_id: str, payload: dict, request: Request) -> dict:
     images = payload.get("images")

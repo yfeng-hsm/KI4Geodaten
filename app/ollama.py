@@ -24,13 +24,30 @@ SURFACE_MATERIALS = {
     "asphalt",
     "concrete",
     "paving_stones",
+    "sett",
     "unpaved",
     "uncertain",
 }
 YES_NO_UNCERTAIN = {"yes", "no", "uncertain"}
+UNUSABLE_REASONS = {
+    "none",
+    "poor_image_quality",
+    "transit_vehicle",
+    "railway_scene",
+    "uncertain",
+}
 VLM_FIELDS = (
+    "unusable_reason",
     "capture_position",
     "surface_material",
+    "left_sidewalk",
+    "left_sidewalk_surface_material",
+    "right_sidewalk",
+    "right_sidewalk_surface_material",
+    "left_adjacent_road_type",
+    "left_adjacent_road_surface_material",
+    "right_adjacent_road_type",
+    "right_adjacent_road_surface_material",
     "traffic_signal",
     "bench",
     "waste_basket",
@@ -44,8 +61,17 @@ VLM_PROMPT = """
 请返回严格 JSON，不要使用 Markdown，不要添加解释文字。字段如下：
 
 {
+  "unusable_reason": "none | poor_image_quality | transit_vehicle | railway_scene | uncertain",
   "capture_position": "vehicle_road | pedestrian_road | bicycle_road | other_location | uncertain",
-  "surface_material": "asphalt | concrete | paving_stones | unpaved | uncertain",
+  "surface_material": "asphalt | concrete | paving_stones | sett | unpaved | uncertain",
+  "left_sidewalk": "yes | no | uncertain | null",
+  "left_sidewalk_surface_material": "asphalt | concrete | paving_stones | sett | unpaved | uncertain | null",
+  "right_sidewalk": "yes | no | uncertain | null",
+  "right_sidewalk_surface_material": "asphalt | concrete | paving_stones | sett | unpaved | uncertain | null",
+  "left_adjacent_road_type": "vehicle_road | bicycle_road | none | uncertain | null",
+  "left_adjacent_road_surface_material": "asphalt | concrete | paving_stones | sett | unpaved | uncertain | null",
+  "right_adjacent_road_type": "vehicle_road | bicycle_road | none | uncertain | null",
+  "right_adjacent_road_surface_material": "asphalt | concrete | paving_stones | sett | unpaved | uncertain | null",
   "traffic_signal": "yes | no | uncertain",
   "bench": "yes | no | uncertain",
   "waste_basket": "yes | no | uncertain",
@@ -56,6 +82,11 @@ VLM_PROMPT = """
 }
 
 判断规则：
+- 如果图像过暗、过曝、严重模糊、运动模糊、雨雪/污渍遮挡、镜头被遮挡、压缩伪影严重、画面主要是天空/车身/墙面/近距离物体，导致无法可靠判断拍摄位置或正下方路面，unusable_reason 返回 poor_image_quality，capture_position 返回 other_location，surface_material 返回 uncertain，其它道路邻接字段返回 null。
+- 如果图像明显是在火车、电车、轻轨或其它轨道交通车辆上/车厢内拍摄，unusable_reason 返回 transit_vehicle，capture_position 返回 other_location，surface_material 返回 uncertain，其它道路邻接字段返回 null。
+- 如果图像主要是铁轨、站台轨道区、铁路设施或无法对应街道通行空间，unusable_reason 返回 railway_scene，capture_position 返回 other_location，surface_material 返回 uncertain，其它道路邻接字段返回 null。
+- 只有图像清晰且可以用于街道/人行道/自行车道空间分析时，unusable_reason 返回 none。
+- 不要为了覆盖特殊位置而强行猜测；图像证据不足时优先返回 poor_image_quality 或 uncertain，并把 surface_material 返回 uncertain。
 - capture_position 表示拍摄者/相机最可能所在的位置。
 - vehicle_road: 车行道、机动车道路或路肩。
 - pedestrian_road: 人行道、步行路径、广场步行区域。
@@ -65,16 +96,29 @@ VLM_PROMPT = """
 - surface_material 只关心画面正下方/最近处地面材料。
 - asphalt: 沥青。
 - concrete: 混凝土或大块整体水泥面。
-- paving_stones: 铺装砖、石板、鹅卵石、联锁砖。
+- paving_stones: 相对平整、闭合、缝隙很窄的人工块材、砖、联锁砖或平整石板铺面；表面通常连续且适合平稳通行。
+- sett: 天然石块铺面，石块大致有平顶但更粗糙，规则或不规则，石块之间不完全闭合，缝隙更明显，表面不如 paving_stones 平整。
 - unpaved: 土路、砂砾、草地、裸土。
 - uncertain: 无法判断。
+- 马路边缘的一排路缘石、curbstone、边界石或排水石不应被识别为 paving_stones；只有画面正下方/最近处实际通行表面由密集铺装砖或石板构成时，才返回 paving_stones。
+- left_sidewalk/right_sidewalk 只在 capture_position 为 vehicle_road 时判断，以相机朝向为前方，左/右分别表示画面前进方向的左侧/右侧是否存在人行道。
+- 如果 capture_position 不是 vehicle_road，left_sidewalk、right_sidewalk 和对应 surface_material 必须返回 null。
+- 如果车行道左侧或右侧没有人行道，对应 sidewalk 字段返回 no，surface_material 返回 null。
+- 如果存在人行道但材质无法判断，对应 sidewalk 字段返回 yes，surface_material 返回 uncertain。
+- sidewalk surface_material 只描述人行道通行面，不要把单排路缘石/curbstone 当作 paving_stones。
+- left_adjacent_road_type/right_adjacent_road_type 只在 capture_position 为 pedestrian_road 时判断，以相机朝向为前方，左/右表示行人道路前进方向两侧是否紧邻车行道或自行车道。
+- 如果 capture_position 不是 pedestrian_road，left_adjacent_road_type、right_adjacent_road_type 和对应 surface_material 必须返回 null。
+- 如果行人道一侧紧邻车行道，adjacent_road_type 返回 vehicle_road，并提取该车行道可见通行面的 surface_material。
+- 如果行人道一侧紧邻自行车道，adjacent_road_type 返回 bicycle_road，并提取该自行车道可见通行面的 surface_material。
+- 如果行人道一侧没有紧邻车行道或自行车道，adjacent_road_type 返回 none，surface_material 返回 null。
+- 如果能看到相邻道路但类型或材质无法判断，类型或材质分别返回 uncertain。
 - traffic_signal / bench / waste_basket 只判断图像中是否可见对应设施。
 - independent_bicycle_road 表示是否存在与机动车道物理或视觉上独立的自行车道路。
 - independent_pedestrian_road 表示是否存在与机动车道物理或视觉上独立的人行道路。
 - yes/no/uncertain 字段无法判断时必须返回 uncertain。
 """.strip()
 
-PROMPT_VERSION = "street-position-surface-assets-v2"
+PROMPT_VERSION = "street-position-surface-assets-sidewalk-adjacent-quality-v6"
 
 
 class OllamaConfigurationError(RuntimeError):
@@ -269,12 +313,20 @@ def _stored_image_properties(properties: dict[str, Any]) -> dict[str, Any]:
 
 
 def _normalize_result(data: dict[str, Any]) -> dict[str, Any]:
+    unusable_reason = str(data.get("unusable_reason", "none")).strip()
+    if unusable_reason not in UNUSABLE_REASONS:
+        unusable_reason = "uncertain"
     capture_position = str(data.get("capture_position", "uncertain")).strip()
     surface_material = str(data.get("surface_material", "uncertain")).strip()
     if capture_position not in CAPTURE_POSITIONS:
         capture_position = "uncertain"
     if surface_material not in SURFACE_MATERIALS:
         surface_material = "uncertain"
+    if unusable_reason != "none":
+        capture_position = "other_location"
+        surface_material = "uncertain"
+    sidewalk_fields = _normalize_sidewalk_fields(data, capture_position)
+    adjacent_road_fields = _normalize_adjacent_road_fields(data, capture_position)
     yes_no_fields = {}
     for field in (
         "traffic_signal",
@@ -290,9 +342,63 @@ def _normalize_result(data: dict[str, Any]) -> dict[str, Any]:
     except (TypeError, ValueError):
         confidence = 0.0
     return {
+        "unusable_reason": unusable_reason,
         "capture_position": capture_position,
         "surface_material": surface_material,
+        **sidewalk_fields,
+        **adjacent_road_fields,
         **yes_no_fields,
         "confidence": confidence,
         "reason": str(data.get("reason", "")).strip()[:300],
     }
+
+
+def _normalize_sidewalk_fields(data: dict[str, Any], capture_position: str) -> dict[str, str | None]:
+    if capture_position != "vehicle_road":
+        return {
+            "left_sidewalk": None,
+            "left_sidewalk_surface_material": None,
+            "right_sidewalk": None,
+            "right_sidewalk_surface_material": None,
+        }
+
+    normalized: dict[str, str | None] = {}
+    for side in ("left", "right"):
+        sidewalk_key = f"{side}_sidewalk"
+        surface_key = f"{side}_sidewalk_surface_material"
+        sidewalk = str(data.get(sidewalk_key, "uncertain")).strip()
+        if sidewalk not in YES_NO_UNCERTAIN:
+            sidewalk = "uncertain"
+        surface = str(data.get(surface_key, "uncertain")).strip()
+        if sidewalk == "yes":
+            normalized[surface_key] = surface if surface in SURFACE_MATERIALS else "uncertain"
+        else:
+            normalized[surface_key] = None
+        normalized[sidewalk_key] = sidewalk
+    return normalized
+
+
+def _normalize_adjacent_road_fields(data: dict[str, Any], capture_position: str) -> dict[str, str | None]:
+    if capture_position != "pedestrian_road":
+        return {
+            "left_adjacent_road_type": None,
+            "left_adjacent_road_surface_material": None,
+            "right_adjacent_road_type": None,
+            "right_adjacent_road_surface_material": None,
+        }
+
+    allowed_types = {"vehicle_road", "bicycle_road", "none", "uncertain"}
+    normalized: dict[str, str | None] = {}
+    for side in ("left", "right"):
+        type_key = f"{side}_adjacent_road_type"
+        surface_key = f"{side}_adjacent_road_surface_material"
+        road_type = str(data.get(type_key, "uncertain")).strip()
+        if road_type not in allowed_types:
+            road_type = "uncertain"
+        surface = str(data.get(surface_key, "uncertain")).strip()
+        if road_type in {"vehicle_road", "bicycle_road"}:
+            normalized[surface_key] = surface if surface in SURFACE_MATERIALS else "uncertain"
+        else:
+            normalized[surface_key] = None
+        normalized[type_key] = road_type
+    return normalized

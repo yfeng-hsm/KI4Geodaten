@@ -17,6 +17,7 @@ class Settings:
     ollama_timeout_seconds: int
     ollama_max_images_per_request: int
     ollama_image_thumb_size: int
+    ollama_concurrency: int = 4
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -35,12 +36,13 @@ class Settings:
             ),
             database_url=database_url,
             ollama_base_url=ollama_base_url,
-            ollama_model=os.getenv("OLLAMA_MODEL", "gemma4:31b").strip(),
+            ollama_model=os.getenv("OLLAMA_MODEL", "gemma4:26b").strip(),
             ollama_timeout_seconds=int(os.getenv("OLLAMA_TIMEOUT_SECONDS", "180")),
             ollama_max_images_per_request=max(
                 1, int(os.getenv("OLLAMA_MAX_IMAGES_PER_REQUEST", "20"))
             ),
             ollama_image_thumb_size=_ollama_image_thumb_size(),
+            ollama_concurrency=max(1, int(os.getenv("OLLAMA_CONCURRENCY", "4"))),
         )
 
 

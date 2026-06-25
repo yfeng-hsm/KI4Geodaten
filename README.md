@@ -76,13 +76,16 @@ Overpass 原始响应缓存到 Docker 卷中的 `/app/data/cache/osm_mainz_overp
 
 ```bash
 OLLAMA_BASE_URL=http://100.87.51.96:11434
-OLLAMA_MODEL=gemma4:31b
+OLLAMA_MODEL=gemma4:26b
 OLLAMA_IMAGE_THUMB_SIZE=512
+OLLAMA_CONCURRENCY=4
 ```
 
 右上角状态会分别显示 Mapillary 配置状态和 Docker 容器内 Ollama 连通状态。模型下拉框来自 Ollama `/api/tags`。VLM 不会自动分析；需要先选择 cell、确认访问 Mapillary，然后点击右侧 Process 按钮处理当前 cell 的全部图像。
 
 VLM 默认使用最大 512px 图像输入：后端优先下载 Mapillary `thumb_1024_url` 并在容器内缩放到 512px，再发给 Ollama。前端预览仍使用 `thumb_1024_url`。如果后续字段需要更细的远处设施识别，可以在 `.env` 中把 `OLLAMA_IMAGE_THUMB_SIZE` 改为 `1024` 后重建容器；如果需要更快但更粗略，可改为 `256`。
+
+队列仍然一次只执行一个 VLM job，但单个 job 内会按 `OLLAMA_CONCURRENCY` 并发请求 Ollama；默认值为 `4`，对应 Ollama 服务端配置的 parallel 4。取消正在运行的 job 时，最多需要等待当前并发批次内的请求返回。
 
 分析结果逐张写入 PostGIS 表 `vlm_image_analysis`，不会等整个 cell 完成后才保存。PostGIS 使用 Docker volume `postgres-data`，因此容器重启后结果仍保留。cell 批处理默认跳过已经存在的 `image_id`，避免重复消耗模型；勾选“覆盖已有 VLM 结果”后才会重新处理并覆盖当前 cell。每张图片详情中的单图 Process 会覆盖该图片旧结果。
 
@@ -90,13 +93,30 @@ VLM 默认使用最大 512px 图像输入：后端优先下载 Mapillary `thumb_
 
 当前 prompt 提取字段：
 
+- `unusable_reason`: `none`, `poor_image_quality`, `transit_vehicle`, `railway_scene`, `uncertain`
 - `capture_position`: `vehicle_road`, `pedestrian_road`, `bicycle_road`, `other_location`, `uncertain`
-- `surface_material`: `asphalt`, `concrete`, `paving_stones`, `unpaved`, `uncertain`
+- `surface_material`: `asphalt`, `concrete`, `paving_stones`, `sett`, `unpaved`, `uncertain`
+- `left_sidewalk`: `yes`, `no`, `uncertain`, `null`
+- `left_sidewalk_surface_material`: `asphalt`, `concrete`, `paving_stones`, `sett`, `unpaved`, `uncertain`, `null`
+- `right_sidewalk`: `yes`, `no`, `uncertain`, `null`
+- `right_sidewalk_surface_material`: `asphalt`, `concrete`, `paving_stones`, `sett`, `unpaved`, `uncertain`, `null`
+- `left_adjacent_road_type`: `vehicle_road`, `bicycle_road`, `none`, `uncertain`, `null`
+- `left_adjacent_road_surface_material`: `asphalt`, `concrete`, `paving_stones`, `sett`, `unpaved`, `uncertain`, `null`
+- `right_adjacent_road_type`: `vehicle_road`, `bicycle_road`, `none`, `uncertain`, `null`
+- `right_adjacent_road_surface_material`: `asphalt`, `concrete`, `paving_stones`, `sett`, `unpaved`, `uncertain`, `null`
 - `traffic_signal`: `yes`, `no`, `uncertain`
 - `bench`: `yes`, `no`, `uncertain`
 - `waste_basket`: `yes`, `no`, `uncertain`
 - `independent_bicycle_road`: `yes`, `no`, `uncertain`
 - `independent_pedestrian_road`: `yes`, `no`, `uncertain`
+
+`left_sidewalk` 和 `right_sidewalk` 只对 `capture_position=vehicle_road` 的观察生效，以相机朝向为前方判断左右侧。行人道、自行车道和其它位置会写入 `null`。单排路缘石、curbstone 或边界石不算 `paving_stones`。`paving_stones` 表示平整、闭合、缝隙很窄的块材/砖/石板通行面；`sett` 表示更粗糙的天然石块铺面，石块之间不完全闭合且缝隙更明显。
+
+`left_adjacent_road_type` 和 `right_adjacent_road_type` 只对 `capture_position=pedestrian_road` 的观察生效，以相机朝向为前方判断行人道路两侧是否紧邻车行道或自行车道，并记录该相邻道路可见通行面的表面材质。道路匹配和 road surface validation 会优先把这些相邻道路表面作为被匹配车行道/自行车道的表面观测，避免把人行道脚下材质误用于车行道。
+
+火车、电车、轻轨等轨道交通车辆上/车厢内拍摄的图像，或主要对应铁路轨道空间的图像，会写入 `unusable_reason=transit_vehicle` 或 `railway_scene`，并强制 `capture_position=other_location`、`surface_material=uncertain`。道路匹配和 road surface validation 会排除这些图像。
+
+过暗、过曝、严重模糊、遮挡、画面主要不是可判读街道空间的图像会写入 `unusable_reason=poor_image_quality`。这些图像同样会被道路匹配和 road surface validation 排除；当前 cell 的 5m 代表点自动处理会在同一 5m 聚类内继续寻找未处理图片作为替代，直到找到可用结果或该聚类图片耗尽。
 
 ## 测试
 
@@ -123,6 +143,10 @@ docker compose run --rm app pytest
 - `GET /api/mainz/grids`
 - `GET /api/mainz/grids/{grid_id}`
 - `GET /api/mainz/grids/{grid_id}/map-layers`
+- `GET /api/mainz/road-surface-validation`
+  - Mainz 全域道路 surface 评估。只返回 OSM `surface` 可归类且至少有 3 个 VLM `surface_material` 观测的 road segment；绿色表示语义一致，红色表示不一致。`sett`、`cobblestone`、`unhewn_cobblestone` 会归为 `sett`；`compacted`、`fine_gravel`、`gravel`、`ground`、`grass_paver` 等 OSM surface 会归为 `unpaved`。
+- `GET /api/mainz/grids/{grid_id}/road-surface-validation`
+  - 当前 100m cell 内道路 surface 评估，规则同全域接口。
 - `GET /api/osm/roads/{osm_id}`
 - `GET /api/osm/roads/{osm_id}/vlm-matches`
   - 参数：`max_distance_m` 默认 35，`close_override_m` 默认 5，`view_fov_deg` 默认 110，`on_road_visible_m` 默认 1，`no_heading_visible_m` 默认 5，`road_axis_tolerance_deg` 默认 35，`limit` 默认 200。

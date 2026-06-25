@@ -84,12 +84,19 @@ class VLMAnalysisStore:
                     failed integer NOT NULL DEFAULT 0,
                     current_image_id text,
                     last_stored_image_id text,
+                    analysis_seconds_sum double precision NOT NULL DEFAULT 0,
                     error text,
                     created_at timestamptz NOT NULL DEFAULT now(),
                     started_at timestamptz,
                     updated_at timestamptz NOT NULL DEFAULT now(),
                     completed_at timestamptz
                 )
+                """
+            )
+            conn.execute(
+                """
+                ALTER TABLE vlm_processing_jobs
+                ADD COLUMN IF NOT EXISTS analysis_seconds_sum double precision NOT NULL DEFAULT 0
                 """
             )
             conn.execute(
@@ -296,6 +303,7 @@ class VLMAnalysisStore:
             "failed",
             "current_image_id",
             "last_stored_image_id",
+            "analysis_seconds_sum",
             "error",
             "completed_at",
         }
@@ -335,6 +343,75 @@ class VLMAnalysisStore:
                 """,
                 (status, error, datetime.now(timezone.utc), job_id, image_id),
             )
+
+    def should_cancel_job(self, job_id: str) -> bool:
+        if not self.database_url:
+            return False
+        self.ensure_schema()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT status FROM vlm_processing_jobs WHERE job_id = %s",
+                (job_id,),
+            ).fetchone()
+        return bool(row and row["status"] == "cancelling")
+
+    def cancel_job(self, job_id: str) -> dict[str, Any] | None:
+        if not self.database_url:
+            raise RuntimeError("DATABASE_URL is not configured")
+        self.ensure_schema()
+        now = datetime.now(timezone.utc)
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT status
+                FROM vlm_processing_jobs
+                WHERE job_id = %s
+                FOR UPDATE
+                """,
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            status = row["status"]
+            if status == "queued":
+                updated = conn.execute(
+                    """
+                    UPDATE vlm_processing_jobs
+                    SET status = 'cancelled',
+                        current_image_id = NULL,
+                        completed_at = %s,
+                        updated_at = %s
+                    WHERE job_id = %s
+                    RETURNING *
+                    """,
+                    (now, now, job_id),
+                ).fetchone()
+                conn.execute(
+                    """
+                    UPDATE vlm_processing_job_items
+                    SET status = 'cancelled',
+                        updated_at = %s
+                    WHERE job_id = %s AND status = 'queued'
+                    """,
+                    (now, job_id),
+                )
+            elif status == "running":
+                updated = conn.execute(
+                    """
+                    UPDATE vlm_processing_jobs
+                    SET status = 'cancelling',
+                        updated_at = %s
+                    WHERE job_id = %s
+                    RETURNING *
+                    """,
+                    (now, job_id),
+                ).fetchone()
+            else:
+                updated = conn.execute(
+                    "SELECT * FROM vlm_processing_jobs WHERE job_id = %s",
+                    (job_id,),
+                ).fetchone()
+        return self._format_job_row(updated)
 
     def existing_image_ids(self, image_ids: list[str]) -> set[str]:
         if not self.database_url or not image_ids:
@@ -439,6 +516,28 @@ class VLMAnalysisStore:
             "results": results,
         }
 
+    def delete_result(self, image_id: str) -> bool:
+        if not self.database_url:
+            raise RuntimeError("DATABASE_URL is not configured")
+        self.ensure_schema()
+        with self._connect() as conn:
+            result = conn.execute(
+                "DELETE FROM vlm_image_analysis WHERE image_id = %s",
+                (image_id,),
+            )
+        return bool(result.rowcount)
+
+    def delete_results_for_grid(self, grid_id: str) -> int:
+        if not self.database_url:
+            raise RuntimeError("DATABASE_URL is not configured")
+        self.ensure_schema()
+        with self._connect() as conn:
+            result = conn.execute(
+                "DELETE FROM vlm_image_analysis WHERE grid_id = %s",
+                (grid_id,),
+            )
+        return int(result.rowcount or 0)
+
     def _connect(self) -> psycopg.Connection:
         assert self.database_url is not None
         return psycopg.connect(self.database_url, row_factory=dict_row, connect_timeout=3)
@@ -468,6 +567,7 @@ class VLMAnalysisStore:
             "analyzed": row["analyzed"],
             "skipped": row["skipped"],
             "failed": row["failed"],
+            "analysis_seconds_sum": float(row.get("analysis_seconds_sum") or 0),
             "current_image_id": row["current_image_id"],
             "last_stored_image_id": row["last_stored_image_id"],
             "error": row["error"],

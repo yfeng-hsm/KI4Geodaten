@@ -62,15 +62,26 @@ let requestSequence = 0;
 let cellMapSequence = 0;
 let vlmResultsSequence = 0;
 let allVlmResultsSequence = 0;
+let vlmRenderFrame = null;
 let activeVlmJobId = null;
 let vlmJobTimer = null;
 let ollamaReady = false;
 let selectedModel = "";
 let selectedVlmTheme = "capture_position";
+let surfaceValidationRunning = false;
 
 const VLM_DISPLAY_FIELDS = [
+  "unusable_reason",
   "capture_position",
   "surface_material",
+  "left_sidewalk",
+  "left_sidewalk_surface_material",
+  "right_sidewalk",
+  "right_sidewalk_surface_material",
+  "left_adjacent_road_type",
+  "left_adjacent_road_surface_material",
+  "right_adjacent_road_type",
+  "right_adjacent_road_surface_material",
   "traffic_signal",
   "bench",
   "waste_basket",
@@ -81,8 +92,17 @@ const VLM_DISPLAY_FIELDS = [
 ];
 
 const VLM_THEME_FIELDS = [
+  "unusable_reason",
   "capture_position",
   "surface_material",
+  "left_sidewalk",
+  "left_sidewalk_surface_material",
+  "right_sidewalk",
+  "right_sidewalk_surface_material",
+  "left_adjacent_road_type",
+  "left_adjacent_road_surface_material",
+  "right_adjacent_road_type",
+  "right_adjacent_road_surface_material",
   "traffic_signal",
   "bench",
   "waste_basket",
@@ -91,6 +111,7 @@ const VLM_THEME_FIELDS = [
 ];
 
 const CELL_PROCESS_DISTANCE_METERS = 5;
+const VLM_RENDER_BOUNDS_PADDING = 0.18;
 
 function censusGridStyle(feature) {
   const population = feature.properties.population;
@@ -153,17 +174,34 @@ const imageLayer = L.geoJSON(null, {
 
 const vlmResultLayer = L.geoJSON(null, {
   pane: "vlmResultPane",
-  pointToLayer: (feature, latlng) => L.circleMarker(latlng, {
-    pane: "vlmResultPane",
-    radius: 8,
-    color: "#18201d",
-    weight: 3,
-    fillColor: vlmThemeColor(feature.properties.theme_value),
-    fillOpacity: 0.95,
-    className: "vlm-result-point",
-    interactive: true,
-    renderer: vlmResultRenderer,
-  }),
+  pointToLayer: (feature, latlng) => {
+    if (feature.properties.observation_role === "center") {
+      const angle = Number(feature.properties.heading_deg);
+      const color = vlmThemeColor(feature.properties.theme_value);
+      return L.marker(latlng, {
+        pane: "vlmResultPane",
+        icon: L.divIcon({
+          className: "vlm-direction-marker",
+          html: `<span style="--vlm-color: ${escapeAttribute(color)}; transform: rotate(${Number.isFinite(angle) ? angle : 0}deg)">▲</span>`,
+          iconSize: [24, 24],
+          iconAnchor: [12, 12],
+        }),
+        keyboard: true,
+        title: `${feature.properties.image_id} center ${feature.properties.theme_value}`,
+      });
+    }
+    return L.circleMarker(latlng, {
+      pane: "vlmResultPane",
+      radius: 3.5,
+      color: "#18201d",
+      weight: 1.4,
+      fillColor: vlmThemeColor(feature.properties.theme_value),
+      fillOpacity: 0.9,
+      className: "vlm-result-point vlm-result-point-virtual",
+      interactive: true,
+      renderer: vlmResultRenderer,
+    });
+  },
   onEachFeature: (feature, layer) => {
     layer.on("click", (event) => {
       L.DomEvent.stopPropagation(event);
@@ -175,7 +213,7 @@ const vlmResultLayer = L.geoJSON(null, {
       }
     });
     layer.bindTooltip(
-      `${feature.properties.image_id}<br>${selectedVlmTheme}: ${feature.properties.theme_value}`,
+      `${feature.properties.image_id}<br>${feature.properties.observation_role}: ${feature.properties.theme_field}<br>${feature.properties.theme_value}`,
       { direction: "top", opacity: 0.9 }
     );
   },
@@ -255,29 +293,55 @@ const roadMatchPointLayer = L.geoJSON(null, {
   pointToLayer: (feature, latlng) => L.circleMarker(latlng, {
     pane: "roadMatchPane",
     renderer: roadMatchRenderer,
-    radius: 6,
-    color: "#ffffff",
-    weight: 2,
-    fillColor: roadColor(feature.properties.road_category),
+    radius: feature.properties.virtual_observation ? 8 : 6,
+    color: feature.properties.virtual_observation ? "#111827" : "#ffffff",
+    weight: feature.properties.virtual_observation ? 2.5 : 2,
+    dashArray: feature.properties.virtual_observation ? "3 3" : null,
+    fillColor: feature.properties.virtual_observation
+      ? vlmThemeColor(feature.properties.matched_road_surface_material)
+      : roadColor(feature.properties.road_category),
     fillOpacity: 1,
     interactive: true,
   }),
   onEachFeature: (feature, layer) => {
     layer.on("click", (event) => {
       L.DomEvent.stopPropagation(event);
-      showStoredVlmPoint(feature.properties.image_id);
+    });
+    layer.bindPopup(roadObservationPopupHtml(feature.properties || {}), {
+      maxWidth: 380,
+      className: "road-popup",
     });
   },
 });
 
+const roadSurfaceValidationLayer = L.geoJSON(null, {
+  pane: "roadMatchPane",
+  renderer: roadMatchRenderer,
+  interactive: true,
+  style: (feature) => ({
+    color: feature.properties.surface_validation === "match" ? "#2b8a3e" : "#c92a2a",
+    weight: 13,
+    opacity: 0.48,
+    lineCap: "round",
+    lineJoin: "round",
+  }),
+  onEachFeature: (feature, layer) => {
+    layer.on("click", (event) => {
+      L.DomEvent.stopPropagation(event);
+    });
+    layer.bindPopup(surfaceValidationPopupHtml(feature.properties || {}), {
+      maxWidth: 380,
+      className: "road-popup",
+    });
+  },
+}).addTo(map);
+
 const roadMatchLayerGroup = L.layerGroup([
   selectedRoadLayer,
   roadMatchLinkLayer,
-  roadMatchPointLayer,
 ]).addTo(map);
 selectedRoadLayer.addTo(map);
 roadMatchLinkLayer.addTo(map);
-roadMatchPointLayer.addTo(map);
 
 L.control.layers(
   { OpenStreetMap: osmBasemap },
@@ -292,6 +356,7 @@ L.control.layers(
     "Mapillary images": imageLayer,
     "VLM result thematic points": vlmResultLayer,
     "Road-VLM match links": roadMatchLayerGroup,
+    "Road surface validation": roadSurfaceValidationLayer,
   },
   { collapsed: false, position: "topright" }
 ).addTo(map);
@@ -312,6 +377,10 @@ const themePanelElement = document.querySelector(".theme-panel");
 const imageDetailElement = document.getElementById("image-detail");
 const processCellVlmButton = document.getElementById("process-cell-vlm-button");
 const processCurrentImageButton = document.getElementById("process-current-image-button");
+const deleteCellVlmButton = document.getElementById("delete-cell-vlm-button");
+const validateRoadSurfaceButton = document.getElementById("validate-road-surface-button");
+const surfaceValidationProgress = document.getElementById("surface-validation-progress");
+const surfaceValidationStatus = document.getElementById("surface-validation-status");
 const vlmProgressElement = document.getElementById("vlm-progress");
 const vlmStatusElement = document.getElementById("vlm-status");
 const forceVlmCheckbox = document.getElementById("force-vlm-checkbox");
@@ -349,6 +418,21 @@ async function apiPost(url, payload) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
+  if (!response.ok) {
+    let message = `HTTP ${response.status}`;
+    try {
+      const body = await response.json();
+      message = body.detail || message;
+    } catch (_error) {
+      // Keep the HTTP status when the response is not JSON.
+    }
+    throw new Error(message);
+  }
+  return response.json();
+}
+
+async function apiDelete(url) {
+  const response = await fetch(url, { method: "DELETE" });
   if (!response.ok) {
     let message = `HTTP ${response.status}`;
     try {
@@ -554,18 +638,62 @@ async function selectRoadForVlmMatching(feature, clickLatLng = null) {
     roadMatchLinkLayer.clearLayers();
     roadMatchPointLayer.clearLayers();
     roadMatchLinkLayer.addData(result.matches);
-    roadMatchPointLayer.addData(result.points);
     selectedRoadLayer.bringToFront();
     roadMatchLinkLayer.bringToFront();
-    roadMatchPointLayer.bringToFront();
     if (clickLatLng) {
       selectedRoadLayer.eachLayer((layer) => layer.openPopup(clickLatLng));
     }
     const label = roadCategoryLabel(result.meta.road_category);
-    mapDataStatusElement.textContent = `选中道路（${label}）匹配到 ${result.meta.count} 个 VLM 点；规则：每个图像点只分配一条最近兼容道路；汽车点只能匹配车行道路，行人/自行车点可匹配车行道路；道路最近点在 ${result.meta.view_fov_deg}° 前方视野内，或图像朝向与道路轴线相差不超过 ${result.meta.road_axis_tolerance_deg}°；无朝向历史点只保留 ${result.meta.no_heading_visible_m}m 内最近道路。`;
+    mapDataStatusElement.textContent = `选中道路（${label}）匹配到 ${result.meta.count} 个 VLM 观测；地图只叠加虚线连接，观测符号使用常驻 VLM 图层。`;
   } catch (error) {
     mapDataStatusElement.textContent = `道路匹配失败：${error.message}`;
     mapDataStatusElement.classList.add("error");
+  }
+}
+
+function updateSurfaceValidationButtonState() {
+  if (!validateRoadSurfaceButton) return;
+  validateRoadSurfaceButton.disabled = surfaceValidationRunning;
+}
+
+async function runRoadSurfaceValidation() {
+  if (surfaceValidationRunning) return;
+  surfaceValidationRunning = true;
+  updateSurfaceValidationButtonState();
+  roadSurfaceValidationLayer.clearLayers();
+  surfaceValidationProgress.hidden = false;
+  surfaceValidationProgress.removeAttribute("value");
+  surfaceValidationStatus.classList.remove("error");
+  surfaceValidationStatus.textContent = "正在计算 Mainz 全域 OSM surface 与 VLM surface_material 一致性…";
+  mapDataStatusElement.classList.remove("error");
+  mapDataStatusElement.textContent = "正在计算 Mainz 全域 surface 一致性…";
+  try {
+    const result = await apiGet("/api/mainz/road-surface-validation");
+    if (!result.available) {
+      const message = `surface 一致性计算不可用：${result.reason}`;
+      mapDataStatusElement.textContent = message;
+      surfaceValidationStatus.textContent = message;
+      mapDataStatusElement.classList.add("error");
+      surfaceValidationStatus.classList.add("error");
+      return;
+    }
+    roadSurfaceValidationLayer.addData(result.layers.roads);
+    roadSurfaceValidationLayer.bringToFront();
+    const skipped = result.meta.skipped || {};
+    const message = `全域 surface 一致性：${result.meta.count} 条可评估道路，绿色一致 ${result.meta.match}，红色不一致 ${result.meta.mismatch}。跳过：无 OSM surface ${skipped.no_osm_surface || 0}，OSM surface 未归类 ${skipped.unmapped_osm_surface || 0}，无 VLM 匹配 ${skipped.no_matches || 0}，无可用 VLM surface ${skipped.no_vlm_surface || 0}，少于 3 个 VLM surface 观测 ${skipped.too_few_vlm_observations || 0}。`;
+    mapDataStatusElement.textContent = message;
+    surfaceValidationStatus.textContent = message;
+  } catch (error) {
+    const message = `surface 一致性计算失败：${error.message}`;
+    mapDataStatusElement.textContent = message;
+    surfaceValidationStatus.textContent = message;
+    mapDataStatusElement.classList.add("error");
+    surfaceValidationStatus.classList.add("error");
+  } finally {
+    surfaceValidationRunning = false;
+    surfaceValidationProgress.hidden = true;
+    surfaceValidationProgress.value = 0;
+    updateSurfaceValidationButtonState();
   }
 }
 
@@ -667,11 +795,36 @@ function roadPopupHtml(properties) {
   `;
 }
 
+function roadObservationPopupHtml(properties) {
+  const isVirtual = Boolean(properties.virtual_observation);
+  return `
+    <div class="road-popup-content">
+      <strong>${isVirtual ? "虚拟观测点" : "中心观测点"}</strong>
+      <dl>
+        <dt>投票道路</dt><dd>${escapeHtml(roadCategoryLabel(properties.road_category))}</dd>
+        <dt>投票表面</dt><dd>${escapeHtml(properties.matched_road_surface_material || "null")}</dd>
+        <dt>观测来源</dt><dd>${escapeHtml(properties.matched_road_surface_source || "null")}</dd>
+        <dt>原始拍摄位置</dt><dd>${escapeHtml(properties.capture_position || "null")}</dd>
+        <dt>原始脚下表面</dt><dd>${escapeHtml(properties.surface_material || "null")}</dd>
+        <dt>虚拟侧向</dt><dd>${escapeHtml(properties.virtual_observation_side || "center")}</dd>
+        <dt>投票权重</dt><dd>${Number(properties.observation_vote || 1)}</dd>
+        <dt>匹配方法</dt><dd>${escapeHtml(properties.match_method || "unknown")}</dd>
+      </dl>
+      <button type="button" data-open-vlm-image="${escapeAttribute(properties.image_id)}">查看原图分析</button>
+    </div>
+  `;
+}
+
 function formatRoadStats(stats) {
   const sections = [
     ["拍摄位置", stats.capture_position],
-    ["路面材料", stats.surface_material],
+    ["投票表面", stats.matched_road_surface_material],
+    ["投票来源", stats.matched_road_surface_source],
     ["图像道路类别", stats.image_road_category],
+    ["左侧相邻道路", stats.left_adjacent_road_type],
+    ["左侧相邻道路表面", stats.left_adjacent_road_surface_material],
+    ["右侧相邻道路", stats.right_adjacent_road_type],
+    ["右侧相邻道路表面", stats.right_adjacent_road_surface_material],
     ["traffic_signal", stats.traffic_signal],
     ["bench", stats.bench],
     ["waste_basket", stats.waste_basket],
@@ -690,6 +843,25 @@ function formatCounts(counts) {
     .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
     .map(([key, value]) => `${key}: ${value}`)
     .join(" · ");
+}
+
+function surfaceValidationPopupHtml(properties) {
+  const status = properties.surface_validation === "match" ? "一致" : "不一致";
+  const statusClass = properties.surface_validation === "match" ? "surface-ok-text" : "surface-bad-text";
+  return `
+    <div class="road-popup-content">
+      <strong>${escapeHtml(properties.name || properties.highway || "OSM road")}</strong>
+      <dl>
+        <dt>结果</dt><dd class="${statusClass}">${escapeHtml(status)}</dd>
+        <dt>highway</dt><dd>${escapeHtml(properties.highway || "unknown")}</dd>
+        <dt>OSM surface</dt><dd>${escapeHtml(properties.osm_surface || "unknown")}</dd>
+        <dt>OSM 语义组</dt><dd>${escapeHtml(properties.osm_surface_group || "unknown")}</dd>
+        <dt>VLM 多数</dt><dd>${escapeHtml(properties.vlm_surface_group || "unknown")}</dd>
+        <dt>VLM 计数</dt><dd>${escapeHtml(formatCounts(properties.vlm_surface_group_counts || {}))}</dd>
+        <dt>匹配点</dt><dd>${Number(properties.vlm_match_count || 0)} 个；可用 surface ${Number(properties.vlm_usable_surface_count || 0)} 个</dd>
+      </dl>
+    </div>
+  `;
 }
 
 function zoomToCurrentGrid() {
@@ -832,15 +1004,65 @@ function renderVlmJobs(jobs) {
     const percent = total > 0 ? (processed / total) * 100 : 0;
     const current = job.current_image_id ? ` · 当前 ${job.current_image_id}` : "";
     const error = job.error ? ` · ${job.error}` : "";
+    const requestAvg = averageAnalyzedJobSeconds(job);
+    const throughputAvg = averageThroughputSeconds(job);
+    const requestAvgText = requestAvg == null ? "单请求平均 --" : `单请求平均 ${formatDuration(requestAvg)}/图`;
+    const throughputAvgText = throughputAvg == null ? "吞吐平均 --" : `吞吐平均 ${formatDuration(throughputAvg)}/图`;
+    const canCancel = ["queued", "running", "cancelling"].includes(job.status);
+    const actionText = job.status === "running" ? "中断" : job.status === "cancelling" ? "中断中" : "取消";
     return `
-      <div class="job-item">
+      <div class="job-item job-${escapeAttribute(job.status || "unknown")}">
         <strong>${escapeHtml(job.status)} · ${processed}/${total} (${percent.toFixed(1)}%)</strong>
+        ${canCancel ? `<button type="button" data-cancel-vlm-job="${escapeAttribute(job.job_id)}"${job.status === "cancelling" ? " disabled" : ""}>${escapeHtml(actionText)}</button>` : ""}
+        <progress class="job-progress" value="${escapeAttribute(processed)}" max="${escapeAttribute(Math.max(total, 1))}"></progress>
         <div class="job-meta">${escapeHtml(job.grid_id || "unknown grid")} · ${escapeHtml(job.model || "model unknown")}</div>
-        <div class="job-meta">分析 ${Number(job.analyzed || 0)} · 跳过 ${Number(job.skipped || 0)} · 失败 ${Number(job.failed || 0)}${escapeHtml(current)}${escapeHtml(error)}</div>
+        <div class="job-meta">${escapeHtml(throughputAvgText)} · ${escapeHtml(requestAvgText)} · 分析 ${Number(job.analyzed || 0)} · 跳过 ${Number(job.skipped || 0)} · 失败 ${Number(job.failed || 0)}${escapeHtml(current)}${escapeHtml(error)}</div>
         <div class="job-meta">更新 ${escapeHtml(job.updated_at ? formatDate(job.updated_at) : "null")}</div>
       </div>
     `;
   }).join("");
+}
+
+function averageAnalyzedJobSeconds(job) {
+  const successfulAnalyzed = Math.max(Number(job.analyzed || 0) - Number(job.failed || 0), 0);
+  if (successfulAnalyzed <= 0) return null;
+  const preciseSeconds = Number(job.analysis_seconds_sum || 0);
+  if (preciseSeconds > 0) return preciseSeconds / successfulAnalyzed;
+  if (!job.started_at) return null;
+  const start = Date.parse(job.started_at);
+  const end = Date.parse(job.completed_at || job.updated_at || new Date().toISOString());
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return null;
+  return (end - start) / 1000 / successfulAnalyzed;
+}
+
+function averageThroughputSeconds(job) {
+  const completedWork = Number(job.analyzed || 0) + Number(job.skipped || 0);
+  const failed = Number(job.failed || 0);
+  const countedWork = Math.max(completedWork - failed, 0);
+  if (countedWork <= 0 || !job.started_at) return null;
+  const start = Date.parse(job.started_at);
+  const end = Date.parse(job.completed_at || job.updated_at || new Date().toISOString());
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return null;
+  return (end - start) / 1000 / countedWork;
+}
+
+function formatDuration(seconds) {
+  if (!Number.isFinite(seconds)) return "--";
+  if (seconds < 60) return `${seconds.toFixed(1)}s`;
+  const minutes = Math.floor(seconds / 60);
+  const rest = Math.round(seconds % 60);
+  return `${minutes}m${String(rest).padStart(2, "0")}s`;
+}
+
+async function cancelVlmJob(jobId) {
+  if (!jobId) return;
+  try {
+    await apiPost(`/api/vlm/jobs/${encodeURIComponent(jobId)}/cancel`, {});
+    await loadVlmJobs();
+  } catch (error) {
+    vlmStatusElement.textContent = `取消 VLM 任务失败：${error.message}`;
+    vlmStatusElement.classList.add("error");
+  }
 }
 
 function emptyProcessPlan() {
@@ -850,6 +1072,8 @@ function emptyProcessPlan() {
     pendingImages: [],
     totalClusters: 0,
     processedClusters: 0,
+    usableClusters: 0,
+    unusableExhaustedClusters: 0,
     redundantCount: 0,
   };
 }
@@ -883,14 +1107,21 @@ function buildCellProcessPlan() {
   const representativeImages = [];
   const pendingImages = [];
   let processedClusters = 0;
+  let usableClusters = 0;
+  let unusableExhaustedClusters = 0;
   clusters.forEach((cluster) => {
-    const processedFeature = cluster.features.find((feature) => hasVlmResult(feature.id));
-    const representative = processedFeature || cluster.features[0];
+    const usableFeature = cluster.features.find((feature) => hasUsableVlmResult(feature.id));
+    const unprocessedFeature = cluster.features.find((feature) => !hasVlmResult(feature.id));
+    const representative = usableFeature || unprocessedFeature || cluster.features[0];
     representativeImages.push(representative);
-    if (processedFeature) {
+    if (usableFeature) {
       processedClusters += 1;
+      usableClusters += 1;
+    } else if (unprocessedFeature) {
+      pendingImages.push(unprocessedFeature);
     } else {
-      pendingImages.push(representative);
+      processedClusters += 1;
+      unusableExhaustedClusters += 1;
     }
   });
 
@@ -900,6 +1131,8 @@ function buildCellProcessPlan() {
     pendingImages,
     totalClusters: clusters.length,
     processedClusters,
+    usableClusters,
+    unusableExhaustedClusters,
     redundantCount: Math.max(currentImageFeatures.length - clusters.length, 0),
   };
 }
@@ -907,6 +1140,14 @@ function buildCellProcessPlan() {
 function hasVlmResult(imageId) {
   const key = String(imageId);
   return Boolean(vlmResultsByImageId[key] || allVlmResultsByImageId[key]);
+}
+
+function hasUsableVlmResult(imageId) {
+  const key = String(imageId);
+  const analysis = vlmResultsByImageId[key] || allVlmResultsByImageId[key];
+  if (!analysis || analysis.error) return false;
+  const fields = analysis.fields || {};
+  return (fields.unusable_reason || "none") === "none";
 }
 
 function updateCellProgressStatus() {
@@ -923,10 +1164,12 @@ function updateCellProgressStatus() {
   vlmStatusElement.classList.remove("error");
   vlmStatusElement.textContent = [
     `${CELL_PROCESS_DISTANCE_METERS}m位置进度 ${currentCellProcessPlan.processedClusters}/${currentCellProcessPlan.totalClusters} (${progressPercent.toFixed(1)}%)`,
+    `有效覆盖 ${currentCellProcessPlan.usableClusters}`,
+    `不可用耗尽 ${currentCellProcessPlan.unusableExhaustedClusters}`,
     `原始点 ${currentImageFeatures.length}`,
     `近邻冗余 ${currentCellProcessPlan.redundantCount}`,
     `待自动处理 ${pending}`,
-    `${CELL_PROCESS_DISTANCE_METERS}m内近邻只允许单图手动 Process`,
+    `${CELL_PROCESS_DISTANCE_METERS}m内已处理但不可用时会自动尝试近邻替代；其余近邻只允许单图手动 Process`,
     latestText.replace(/^；/, ""),
   ].filter(Boolean).join("；");
 }
@@ -992,7 +1235,7 @@ function pollVlmJob(jobId, gridId) {
       await loadVlmJobs();
       await loadVlmResults(gridId);
       await loadAllVlmResults();
-      if (["completed", "failed"].includes(job.status)) {
+      if (["completed", "failed", "cancelled"].includes(job.status)) {
         stopVlmJobPolling();
         activeVlmJobId = null;
         await loadVlmResults(gridId);
@@ -1014,7 +1257,8 @@ function updateVlmJobUi(job) {
   refreshCellProcessPlan();
   const total = Number(job.total || 0);
   const processed = Number(job.processed || 0);
-  resetVlmProgress(currentCellProcessPlan.processedClusters, currentCellProcessPlan.totalClusters);
+  resetVlmProgress(processed, Math.max(total, 1));
+  const serverPercent = total > 0 ? (processed / total) * 100 : 0;
   const progressPercent = currentCellProcessPlan.totalClusters > 0
     ? (currentCellProcessPlan.processedClusters / currentCellProcessPlan.totalClusters) * 100
     : 0;
@@ -1023,8 +1267,12 @@ function updateVlmJobUi(job) {
   const skipped = job.skipped ? `；跳过已有 ${job.skipped}` : "";
   const failed = job.failed ? `；失败 ${job.failed}` : "";
   const completed = job.completed_at ? `；完成 ${formatDate(job.completed_at)}` : "";
+  const requestAvg = averageAnalyzedJobSeconds(job);
+  const throughputAvg = averageThroughputSeconds(job);
+  const requestAvgText = requestAvg == null ? "单请求平均 --/图" : `单请求平均 ${formatDuration(requestAvg)}/图`;
+  const throughputAvgText = throughputAvg == null ? "吞吐平均 --/图" : `吞吐平均 ${formatDuration(throughputAvg)}/图`;
   vlmStatusElement.classList.toggle("error", job.status === "failed");
-  vlmStatusElement.textContent = `VLM ${job.status}：任务 ${processed}/${total}${analyzed}${skipped}${failed}${current}${completed}；${CELL_PROCESS_DISTANCE_METERS}m位置进度 ${currentCellProcessPlan.processedClusters}/${currentCellProcessPlan.totalClusters} (${progressPercent.toFixed(1)}%)`;
+  vlmStatusElement.textContent = `VLM ${job.status}：服务器进度 ${processed}/${total} (${serverPercent.toFixed(1)}%)${analyzed}${skipped}${failed}；${throughputAvgText}；${requestAvgText}${current}${completed}；${CELL_PROCESS_DISTANCE_METERS}m代表点覆盖 ${currentCellProcessPlan.processedClusters}/${currentCellProcessPlan.totalClusters} (${progressPercent.toFixed(1)}%)；有效覆盖 ${currentCellProcessPlan.usableClusters}；不可用耗尽 ${currentCellProcessPlan.unusableExhaustedClusters}`;
 }
 
 function resetVlmPanel(message) {
@@ -1068,6 +1316,9 @@ function updateProcessButtonState() {
   );
   processCellVlmButton.disabled = !canProcessCell;
   processCurrentImageButton.disabled = !canProcessImage;
+  if (deleteCellVlmButton) {
+    deleteCellVlmButton.disabled = !currentGrid || activeVlmJobId || Object.keys(vlmResultsByImageId).length === 0;
+  }
 }
 
 function showImage(feature) {
@@ -1103,6 +1354,7 @@ function showImage(feature) {
       <dt>序列 ID</dt><dd>${escapeHtml(String(properties.sequence_id || "未知"))}</dd>
     </dl>
     <a class="open-mapillary" href="${escapeAttribute(properties.mapillary_url)}" target="_blank" rel="noreferrer">在 Mapillary 街景中打开</a>
+    ${renderImageVlmActions(String(feature.id), Boolean(analysis), true)}
     ${renderVlmResult(analysis)}
   `;
   updateProcessButtonState();
@@ -1132,6 +1384,7 @@ function showStoredVlmPoint(imageId) {
       <dt>主题值</dt><dd>${escapeHtml(formatVlmValue(analysis, selectedVlmTheme))}</dd>
     </dl>
     <a class="open-mapillary" href="${escapeAttribute(mapillaryUrl)}" target="_blank" rel="noreferrer">在 Mapillary 街景中打开</a>
+    ${renderImageVlmActions(String(imageId), Boolean(analysis), false)}
     ${renderVlmResult(analysis)}
   `;
   updateProcessButtonState();
@@ -1164,6 +1417,75 @@ async function startCurrentImageVlmJob() {
     vlmStatusElement.classList.add("error");
     updateProcessButtonState();
     processCurrentImageButton.disabled = false;
+  }
+}
+
+function renderImageVlmActions(imageId, hasAnalysis, canProcess) {
+  return `
+    <div class="image-vlm-actions">
+      <button type="button" data-image-action="process" data-image-id="${escapeAttribute(imageId)}"${canProcess ? "" : " disabled"}>Process 当前图片</button>
+      <button type="button" class="danger" data-image-action="delete-vlm" data-image-id="${escapeAttribute(imageId)}"${hasAnalysis ? "" : " disabled"}>删除 process 信息</button>
+    </div>
+  `;
+}
+
+async function deleteCurrentImageVlmResult(imageId) {
+  if (!imageId) return;
+  const hadCurrentFeature = currentImageFeature && String(currentImageFeature.id) === String(imageId);
+  vlmStatusElement.classList.remove("error");
+  vlmStatusElement.textContent = `正在删除图片 ${imageId} 的 VLM process 信息…`;
+  try {
+    await apiDelete(`/api/vlm-results/${encodeURIComponent(imageId)}`);
+    if (currentGrid) {
+      await loadVlmResults(currentGrid.properties.grid_id);
+    }
+    await loadAllVlmResults();
+    if (hadCurrentFeature && currentImageFeature) {
+      showImage(currentImageFeature);
+    } else {
+      currentImageFeature = null;
+      imageDetailElement.className = "image-detail empty";
+      imageDetailElement.innerHTML = `
+        <div class="placeholder">
+          <strong>已删除 VLM process 信息</strong>
+          <span>图片 ${escapeHtml(String(imageId))} 的分析结果已从数据库删除。</span>
+        </div>
+      `;
+      updateProcessButtonState();
+    }
+    roadSurfaceValidationLayer.clearLayers();
+    surfaceValidationStatus.textContent = "VLM 结果已变更；需要重新计算全域 road surface 一致性。";
+    vlmStatusElement.textContent = `已删除图片 ${imageId} 的 VLM process 信息。`;
+  } catch (error) {
+    vlmStatusElement.textContent = `删除 VLM process 信息失败：${error.message}`;
+    vlmStatusElement.classList.add("error");
+  }
+}
+
+async function deleteCurrentCellVlmResults() {
+  if (!currentGrid || activeVlmJobId) return;
+  const gridId = currentGrid.properties.grid_id;
+  const count = Object.keys(vlmResultsByImageId).length;
+  if (count === 0) return;
+  const confirmed = window.confirm(`删除当前 cell ${gridId} 的 ${count} 条 VLM 结果？这个操作只删除数据库分析结果，不删除 Mapillary 缓存。`);
+  if (!confirmed) return;
+  vlmStatusElement.classList.remove("error");
+  vlmStatusElement.textContent = `正在删除当前 cell ${gridId} 的 VLM 数据…`;
+  updateProcessButtonState();
+  try {
+    const result = await apiDelete(`/api/grids/${encodeURIComponent(gridId)}/vlm-results`);
+    await loadVlmResults(gridId);
+    await loadAllVlmResults();
+    currentCellProcessPlan = emptyProcessPlan();
+    refreshCellProcessPlan();
+    roadSurfaceValidationLayer.clearLayers();
+    surfaceValidationStatus.textContent = "VLM 结果已变更；需要重新计算全域 road surface 一致性。";
+    vlmStatusElement.textContent = `已删除当前 cell ${gridId} 的 ${result.deleted} 条 VLM 结果。`;
+  } catch (error) {
+    vlmStatusElement.textContent = `删除当前 cell VLM 数据失败：${error.message}`;
+    vlmStatusElement.classList.add("error");
+  } finally {
+    updateProcessButtonState();
   }
 }
 
@@ -1231,26 +1553,142 @@ function formatCoordinates(coordinates) {
 }
 
 function renderVlmResultLayer() {
+  if (!map.hasLayer(vlmResultLayer)) return;
   vlmResultLayer.clearLayers();
+  const renderBounds = map.getBounds().pad(VLM_RENDER_BOUNDS_PADDING);
   const imageFeatureById = new Map(currentImageFeatures.map((feature) => [String(feature.id), feature]));
   const features = Object.values(allVlmResultsByImageId).flatMap((analysis) => {
     const imageFeature = imageFeatureById.get(String(analysis.image_id));
     const geometry = imageFeature ? displayGeometry(imageFeature) : analysis.geometry;
     if (!geometry) return [];
-    const themeValue = formatVlmValue(analysis, selectedVlmTheme);
-    return [{
-      type: "Feature",
-      id: analysis.image_id,
-      geometry,
-      properties: {
-        image_id: String(analysis.image_id),
-        theme_field: selectedVlmTheme,
-        theme_value: themeValue,
-        updated_at: analysis.updated_at,
-      },
-    }];
+    return vlmObservationFeatures(analysis, geometry)
+      .filter((feature) => geometryInBounds(feature.geometry, renderBounds))
+      .map((feature) => ({
+        ...feature,
+        id: `${analysis.image_id}:${feature.properties.observation_role}`,
+      }));
   });
   vlmResultLayer.addData({ type: "FeatureCollection", features });
+}
+
+function scheduleVlmResultLayerRender() {
+  if (vlmRenderFrame) window.cancelAnimationFrame(vlmRenderFrame);
+  vlmRenderFrame = window.requestAnimationFrame(() => {
+    vlmRenderFrame = null;
+    renderVlmResultLayer();
+  });
+}
+
+function geometryInBounds(geometry, bounds) {
+  if (!geometry || geometry.type !== "Point") return false;
+  const [lon, lat] = geometry.coordinates || [];
+  if (!Number.isFinite(Number(lon)) || !Number.isFinite(Number(lat))) return false;
+  return bounds.contains([Number(lat), Number(lon)]);
+}
+
+function vlmObservationFeatures(analysis, centerGeometry) {
+  const centerValue = formatVlmValue(analysis, selectedVlmTheme);
+  const features = [{
+      type: "Feature",
+      geometry: centerGeometry,
+      properties: {
+        image_id: String(analysis.image_id),
+        observation_role: "center",
+        observation_vote: 1,
+        heading_deg: analysisHeading(analysis),
+        theme_field: selectedVlmTheme,
+        theme_value: centerValue,
+        updated_at: analysis.updated_at,
+      },
+  }];
+  const heading = analysisHeading(analysis);
+  for (const side of ["left", "right"]) {
+    const virtual = virtualVlmObservation(analysis, centerGeometry, heading, side);
+    if (virtual) features.push(virtual);
+  }
+  return features;
+}
+
+function virtualVlmObservation(analysis, centerGeometry, heading, side) {
+  const fields = analysis.fields || {};
+  const geometry = offsetLngLatGeometry(centerGeometry, heading, side, 2);
+  if (!geometry) return null;
+  let field = null;
+  let value = null;
+  let roleValue = null;
+  if (fields.capture_position === "vehicle_road" && fields[`${side}_sidewalk`] === "yes") {
+    field = `${side}_sidewalk_surface_material`;
+    value = fields[field];
+    roleValue = "pedestrian_road";
+  } else if (fields.capture_position === "pedestrian_road" && ["vehicle_road", "bicycle_road"].includes(fields[`${side}_adjacent_road_type`])) {
+    field = `${side}_adjacent_road_surface_material`;
+    value = fields[field];
+    roleValue = fields[`${side}_adjacent_road_type`];
+  }
+  if (value == null) return null;
+  const themed = virtualThemeValue(analysis, side, field, value, roleValue);
+  return {
+    type: "Feature",
+    geometry,
+    properties: {
+      image_id: String(analysis.image_id),
+      observation_role: side,
+      observation_vote: 1,
+      theme_field: themed.field,
+      theme_value: themed.value,
+      updated_at: analysis.updated_at,
+    },
+  };
+}
+
+function virtualThemeValue(analysis, side, defaultField, defaultValue, roleValue) {
+  const fields = analysis.fields || {};
+  const sidePrefix = selectedVlmTheme.startsWith("left_") ? "left" : selectedVlmTheme.startsWith("right_") ? "right" : null;
+  if (sidePrefix && sidePrefix !== side) {
+    return { field: selectedVlmTheme, value: "null" };
+  }
+  if (selectedVlmTheme === "capture_position") {
+    return { field: "virtual_capture_position", value: roleValue || "null" };
+  }
+  if (selectedVlmTheme === "surface_material") {
+    return { field: defaultField, value: String(defaultValue) };
+  }
+  if (selectedVlmTheme === `${side}_sidewalk`
+    || selectedVlmTheme === `${side}_sidewalk_surface_material`
+    || selectedVlmTheme === `${side}_adjacent_road_type`
+    || selectedVlmTheme === `${side}_adjacent_road_surface_material`) {
+    return { field: selectedVlmTheme, value: formatVlmValue(analysis, selectedVlmTheme) };
+  }
+  if (fields[selectedVlmTheme] != null) {
+    return { field: selectedVlmTheme, value: formatVlmValue(analysis, selectedVlmTheme) };
+  }
+  return { field: defaultField, value: String(defaultValue) };
+}
+
+function analysisHeading(analysis) {
+  const properties = analysis.image_properties || {};
+  const angle = properties.computed_compass_angle ?? properties.compass_angle;
+  const numeric = Number(angle);
+  return Number.isFinite(numeric) ? numeric : null;
+}
+
+function offsetLngLatGeometry(geometry, heading, side, meters) {
+  if (!geometry || geometry.type !== "Point" || heading == null || !["left", "right"].includes(side)) return null;
+  const [lon, lat] = geometry.coordinates || [];
+  if (!Number.isFinite(Number(lon)) || !Number.isFinite(Number(lat))) return null;
+  const bearing = ((Number(heading) + (side === "left" ? -90 : 90)) % 360 + 360) % 360;
+  const radians = bearing * Math.PI / 180;
+  const radius = 6378137;
+  const latRad = Number(lat) * Math.PI / 180;
+  const deltaLat = (meters * Math.cos(radians)) / radius;
+  const deltaLon = (meters * Math.sin(radians)) / (radius * Math.max(Math.cos(latRad), 1e-9));
+  return {
+    type: "Point",
+    coordinates: [
+      Number(lon) + deltaLon * 180 / Math.PI,
+      Number(lat) + deltaLat * 180 / Math.PI,
+    ],
+  };
 }
 
 function vlmThemeColor(value) {
@@ -1259,13 +1697,17 @@ function vlmThemeColor(value) {
     pedestrian_road: "#9c36b5",
     bicycle_road: "#087f5b",
     other_location: "#495057",
+    transit_vehicle: "#7048e8",
+    poor_image_quality: "#e8590c",
+    railway_scene: "#5c677d",
     asphalt: "#343a40",
     concrete: "#868e96",
     paving_stones: "#f08c00",
+    sett: "#9c6644",
     unpaved: "#7f4f24",
     yes: "#087f5b",
     no: "#adb5bd",
-    uncertain: "#f2a900",
+    uncertain: "#4263eb",
     null: "#dee2e6",
   };
   return colors[value] || "#1c7ed6";
@@ -1352,6 +1794,25 @@ function escapeAttribute(value) {
 confirmMapillaryButton.addEventListener("click", loadImages);
 processCellVlmButton.addEventListener("click", startCellVlmJob);
 processCurrentImageButton.addEventListener("click", startCurrentImageVlmJob);
+deleteCellVlmButton?.addEventListener("click", deleteCurrentCellVlmResults);
+validateRoadSurfaceButton?.addEventListener("click", runRoadSurfaceValidation);
+imageDetailElement.addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-image-action]");
+  if (!button) return;
+  const action = button.dataset.imageAction;
+  const imageId = button.dataset.imageId;
+  if (action === "process") {
+    startCurrentImageVlmJob();
+  } else if (action === "delete-vlm") {
+    deleteCurrentImageVlmResult(imageId);
+  }
+});
+map.getContainer().addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-open-vlm-image]");
+  if (!button) return;
+  L.DomEvent.stopPropagation(event);
+  showStoredVlmPoint(button.dataset.openVlmImage);
+});
 modelSelectElement.addEventListener("change", () => {
   selectedModel = modelSelectElement.value;
   updateProcessButtonState();
@@ -1360,10 +1821,15 @@ forceVlmCheckbox.addEventListener("change", () => {
   refreshCellProcessPlan();
 });
 refreshJobsButton?.addEventListener("click", loadVlmJobs);
+vlmJobsElement?.addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-cancel-vlm-job]");
+  if (!button) return;
+  cancelVlmJob(button.dataset.cancelVlmJob);
+});
 mapillaryGeometryModeSelect.addEventListener("change", () => {
   mapillaryGeometryMode = mapillaryGeometryModeSelect.value === "computed" ? "computed" : "original";
   renderImageLayer();
-  renderVlmResultLayer();
+  scheduleVlmResultLayerRender();
   refreshCellProcessPlan();
   if (currentImageFeature) showImage(currentImageFeature);
 });
@@ -1371,7 +1837,7 @@ vlmThemeSelect.addEventListener("change", () => {
   selectedVlmTheme = VLM_THEME_FIELDS.includes(vlmThemeSelect.value)
     ? vlmThemeSelect.value
     : "capture_position";
-  renderVlmResultLayer();
+  scheduleVlmResultLayerRender();
 });
 map.on("zoomend", () => {
   [pedestrianRoadLayer, vehicleRoadLayer, bicycleRoadLayer].forEach((layer) => {
@@ -1381,6 +1847,11 @@ map.on("zoomend", () => {
       opacity: 1,
     }));
   });
+  scheduleVlmResultLayerRender();
+});
+map.on("moveend", scheduleVlmResultLayerRender);
+map.on("overlayadd", (event) => {
+  if (event.layer === vlmResultLayer) scheduleVlmResultLayerRender();
 });
 map.on("click", (event) => {
   const roadFeature = nearestRoadFeatureAtLatLng(event.latlng);

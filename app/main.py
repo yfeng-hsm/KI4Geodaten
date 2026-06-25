@@ -1,6 +1,7 @@
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+import time
 from pathlib import Path
 from uuid import uuid4
 
@@ -120,6 +121,29 @@ async def mainz_grid_map_layers(grid_id: str, request: Request) -> dict:
     )
 
 
+@app.get("/api/mainz/grids/{grid_id}/road-surface-validation")
+async def mainz_grid_road_surface_validation(grid_id: str, request: Request) -> dict:
+    census: CensusStore = request.app.state.census
+    if census.cell(grid_id) is None:
+        raise HTTPException(status_code=404, detail="Grid cell is not in Mainz")
+    try:
+        cell = cell_from_id(grid_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return request.app.state.osm.cell_road_surface_validation(
+        grid_id=grid_id,
+        cell_geometry=cell.to_feature()["geometry"],
+    )
+
+
+@app.get("/api/mainz/road-surface-validation")
+async def mainz_road_surface_validation(request: Request) -> dict:
+    return request.app.state.osm.cell_road_surface_validation(
+        grid_id="mainz",
+        cell_geometry=None,
+    )
+
+
 @app.get("/api/osm/roads/{osm_id}")
 async def osm_road(osm_id: int, request: Request) -> dict:
     road = request.app.state.osm.road(osm_id)
@@ -193,6 +217,24 @@ async def all_vlm_results(
     return _enrich_vlm_results_from_cache(result, request.app.state.mapillary.cached_image_index())
 
 
+@app.delete("/api/vlm-results/{image_id}")
+async def delete_vlm_result(image_id: str, request: Request) -> dict:
+    if not request.app.state.vlm_store.configured:
+        raise HTTPException(status_code=503, detail="DATABASE_URL is required for VLM results")
+    deleted = request.app.state.vlm_store.delete_result(image_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="VLM result not found")
+    return {"image_id": image_id, "deleted": True}
+
+
+@app.delete("/api/grids/{grid_id}/vlm-results")
+async def delete_vlm_results_for_grid(grid_id: str, request: Request) -> dict:
+    if not request.app.state.vlm_store.configured:
+        raise HTTPException(status_code=503, detail="DATABASE_URL is required for VLM results")
+    deleted = request.app.state.vlm_store.delete_results_for_grid(grid_id)
+    return {"grid_id": grid_id, "deleted": deleted}
+
+
 @app.post("/api/grids/{grid_id}/vlm-jobs")
 async def start_vlm_job(grid_id: str, payload: dict, request: Request) -> dict:
     if not request.app.state.vlm_store.configured:
@@ -225,6 +267,15 @@ async def vlm_job_status(job_id: str, request: Request) -> dict:
     return job
 
 
+@app.post("/api/vlm/jobs/{job_id}/cancel")
+async def cancel_vlm_job(job_id: str, request: Request) -> dict:
+    job = request.app.state.vlm_store.cancel_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="VLM job not found")
+    request.app.state.vlm_queue_event.set()
+    return job
+
+
 async def _vlm_queue_worker(app: FastAPI) -> None:
     while True:
         job = await asyncio.to_thread(app.state.vlm_store.claim_next_job)
@@ -248,52 +299,96 @@ async def _run_vlm_job(app: FastAPI, job: dict) -> None:
     analyzed = job["analyzed"]
     skipped = job["skipped"]
     failed = job["failed"]
+    analysis_seconds_sum = float(job.get("analysis_seconds_sum") or 0)
+    concurrency = max(1, int(app.state.settings.ollama_concurrency or 1))
+
+    async def process_image(client: httpx.AsyncClient, image: dict) -> dict:
+        image_id = _image_id(image)
+        app.state.vlm_store.update_job_item(job_id, image_id, "running")
+        if image_id in existing_ids:
+            app.state.vlm_store.update_job_item(job_id, image_id, "skipped")
+            return {
+                "processed": 1,
+                "analyzed": 0,
+                "skipped": 1,
+                "failed": 0,
+                "analysis_seconds": 0.0,
+                "stored_image_id": None,
+            }
+
+        started_at = time.perf_counter()
+        result = await app.state.ollama.analyze_one(client, image, model)
+        elapsed_seconds = time.perf_counter() - started_at
+        stored = app.state.vlm_store.upsert(grid_id, result)
+        error = result.get("error")
+        failed_delta = 1 if error or not result.get("ok") else 0
+        app.state.vlm_store.update_job_item(
+            job_id,
+            image_id,
+            "failed" if failed_delta else "completed",
+            error,
+        )
+        return {
+            "processed": 1,
+            "analyzed": 1,
+            "skipped": 0,
+            "failed": failed_delta,
+            "analysis_seconds": 0.0 if failed_delta else elapsed_seconds,
+            "stored_image_id": stored["image_id"],
+        }
+
     try:
         image_ids = [_image_id(image) for image in images]
         existing_ids = set() if force else app.state.vlm_store.existing_image_ids(image_ids)
         async with httpx.AsyncClient(timeout=app.state.settings.ollama_timeout_seconds) as client:
-            for image in images:
-                image_id = _image_id(image)
+            for start in range(0, len(images), concurrency):
+                if app.state.vlm_store.should_cancel_job(job_id):
+                    app.state.vlm_store.update_job(
+                        job_id,
+                        status="cancelled",
+                        completed_at=datetime.now(timezone.utc),
+                        current_image_id=None,
+                    )
+                    return
+                batch = images[start : start + concurrency]
+                running_ids = [_image_id(image) for image in batch]
                 app.state.vlm_store.update_job(
                     job_id,
-                    current_image_id=image_id,
+                    current_image_id=", ".join(running_ids),
                     processed=processed,
                     analyzed=analyzed,
                     skipped=skipped,
                     failed=failed,
+                    analysis_seconds_sum=analysis_seconds_sum,
                 )
-                app.state.vlm_store.update_job_item(job_id, image_id, "running")
-                if image_id in existing_ids:
-                    skipped += 1
-                    processed += 1
-                    app.state.vlm_store.update_job_item(job_id, image_id, "skipped")
-                    app.state.vlm_store.update_job(
-                        job_id,
-                        processed=processed,
-                        skipped=skipped,
-                        current_image_id=None,
-                    )
-                    continue
-                result = await app.state.ollama.analyze_one(client, image, model)
-                if not result.get("ok"):
-                    failed += 1
-                stored = app.state.vlm_store.upsert(grid_id, result)
-                analyzed += 1
-                processed += 1
-                app.state.vlm_store.update_job_item(
-                    job_id,
-                    image_id,
-                    "failed" if result.get("error") else "completed",
-                    result.get("error"),
+                results = await asyncio.gather(
+                    *(process_image(client, image) for image in batch)
                 )
+                last_stored_image_id = None
+                for result in results:
+                    processed += result["processed"]
+                    analyzed += result["analyzed"]
+                    skipped += result["skipped"]
+                    failed += result["failed"]
+                    analysis_seconds_sum += result["analysis_seconds"]
+                    last_stored_image_id = result["stored_image_id"] or last_stored_image_id
                 app.state.vlm_store.update_job(
                     job_id,
                     processed=processed,
                     analyzed=analyzed,
                     failed=failed,
+                    analysis_seconds_sum=analysis_seconds_sum,
                     current_image_id=None,
-                    last_stored_image_id=stored["image_id"],
+                    last_stored_image_id=last_stored_image_id,
                 )
+                if app.state.vlm_store.should_cancel_job(job_id):
+                    app.state.vlm_store.update_job(
+                        job_id,
+                        status="cancelled",
+                        completed_at=datetime.now(timezone.utc),
+                        current_image_id=None,
+                    )
+                    return
         app.state.vlm_store.update_job(
             job_id,
             status="completed",

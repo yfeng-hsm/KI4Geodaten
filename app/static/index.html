@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>KI4Geodaten · Mainz Census 100m 格网</title>
     <link rel="stylesheet" href="/static/vendor/leaflet/leaflet.css">
-    <link rel="stylesheet" href="/static/styles.css?v=20260623-road-click-nearest">
+    <link rel="stylesheet" href="/static/styles.css?v=20260625-vlm-unusable-replacement">
   </head>
   <body>
     <header class="topbar">
@@ -54,23 +54,37 @@
           <span><i class="swatch landuse"></i>土地利用</span>
           <span><i class="swatch image"></i>Mapillary 图像</span>
           <span><i class="swatch match"></i>道路匹配虚线</span>
+          <span><i class="swatch surface-ok"></i>surface一致</span>
+          <span><i class="swatch surface-bad"></i>surface不一致</span>
         </div>
       </section>
 
       <aside class="detail-panel">
         <div class="detail-scroll">
-          <label class="field-picker theme-panel">
+          <div class="field-picker theme-panel">
             <span>结果图层主题</span>
             <select id="vlm-theme-select">
+              <option value="unusable_reason">unusable_reason</option>
               <option value="capture_position">capture_position</option>
               <option value="surface_material">surface_material</option>
+              <option value="left_sidewalk">left_sidewalk</option>
+              <option value="left_sidewalk_surface_material">left_sidewalk_surface_material</option>
+              <option value="right_sidewalk">right_sidewalk</option>
+              <option value="right_sidewalk_surface_material">right_sidewalk_surface_material</option>
+              <option value="left_adjacent_road_type">left_adjacent_road_type</option>
+              <option value="left_adjacent_road_surface_material">left_adjacent_road_surface_material</option>
+              <option value="right_adjacent_road_type">right_adjacent_road_type</option>
+              <option value="right_adjacent_road_surface_material">right_adjacent_road_surface_material</option>
               <option value="traffic_signal">traffic_signal</option>
               <option value="bench">bench</option>
               <option value="waste_basket">waste_basket</option>
               <option value="independent_bicycle_road">independent_bicycle_road</option>
               <option value="independent_pedestrian_road">independent_pedestrian_road</option>
             </select>
-          </label>
+            <button id="validate-road-surface-button" type="button">计算全域 road surface 一致性</button>
+            <progress id="surface-validation-progress" hidden></progress>
+            <p id="surface-validation-status" class="muted">计算后显示所有可匹配 road segment：绿色一致，红色不一致。</p>
+          </div>
 
           <div class="summary">
             <p class="eyebrow">当前格网</p>
@@ -89,6 +103,7 @@
           <div class="vlm-panel">
             <button id="process-cell-vlm-button" disabled>Process 当前 cell 5m代表点</button>
             <button id="process-current-image-button" hidden disabled>Process 当前图片</button>
+            <button id="delete-cell-vlm-button" class="danger" disabled>删除当前 cell 全部 VLM 数据</button>
             <progress id="vlm-progress" value="0" max="1"></progress>
             <p id="vlm-status" class="muted">VLM 尚未处理。先确认访问 Mapillary，再手动处理当前 cell。</p>
             <label class="inline-option">
@@ -128,6 +143,6 @@
     </main>
 
     <script src="/static/vendor/leaflet/leaflet.js"></script>
-    <script src="/static/app.js?v=20260623-road-click-nearest"></script>
+    <script src="/static/app.js?v=20260625-vlm-unusable-replacement"></script>
   </body>
 </html>

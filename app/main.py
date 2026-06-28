@@ -231,6 +231,7 @@ async def map_matching_for_grid(
     max_gap_m: float = Query(default=40.0, ge=5.0, le=500.0),
     sequence_expand_radius: int = Query(default=1, ge=0, le=3),
     use_visual_user_type: bool = Query(default=True),
+    gps_accuracy_m: float = Query(default=6.0, ge=2.0, le=30.0),
 ) -> dict:
     try:
         cell = cell_from_id(grid_id)
@@ -294,6 +295,7 @@ async def map_matching_for_grid(
         sequence_id=str(selected_sequence[0].get("sequence_id") or "unknown"),
         max_gap_m=max_gap_m,
         use_visual_user_type=use_visual_user_type,
+        gps_accuracy_m=gps_accuracy_m,
     )
     result["grid_id"] = grid_id
     result["meta"]["cell_count"] = len(cell_observations)
@@ -305,6 +307,7 @@ async def map_matching_for_grid(
     if sequence_cache_meta is not None:
         result["meta"]["sequence_cache_expand"] = sequence_cache_meta
     result["meta"]["use_visual_user_type"] = use_visual_user_type
+    result["meta"]["gps_accuracy_m"] = gps_accuracy_m
     return result
 
 
@@ -782,6 +785,7 @@ async def _graphhopper_map_matching_segment_layers(
     sequence_id: str,
     max_gap_m: float,
     use_visual_user_type: bool,
+    gps_accuracy_m: float,
 ) -> dict:
     aggregate_layers = _empty_map_matching_layers()
     reasons: list[str] = []
@@ -853,6 +857,7 @@ async def _graphhopper_map_matching_segment_layers(
             segment,
             graphhopper,
             profiles=candidate_profiles,
+            gps_accuracy_m=gps_accuracy_m,
         )
         segment_result = _graphhopper_map_matching_layers(
             segment,
@@ -913,6 +918,7 @@ async def _graphhopper_map_matching_segment_layers(
             "segment_summaries": segment_summaries,
             "max_gap_m": max_gap_m,
             "use_visual_user_type": use_visual_user_type,
+            "gps_accuracy_m": gps_accuracy_m,
             "method": "graphhopper_sequence_map_matching",
         },
     }
@@ -978,9 +984,9 @@ def _candidate_graphhopper_profiles(user_type: str) -> tuple[str, ...]:
     if user_type == "car":
         return ("car",)
     if user_type == "bike":
-        return ("foot", "bike")
+        return ("bike", "foot", "car")
     if user_type == "foot":
-        return ("foot",)
+        return ("foot", "bike", "car")
     return ("foot", "bike", "car")
 
 
@@ -1056,22 +1062,28 @@ async def _best_graphhopper_result(
     graphhopper: GraphHopperClient,
     *,
     profiles: tuple[str, ...] = ("foot", "bike", "car"),
+    gps_accuracy_m: float = 6.0,
 ) -> tuple[str, dict]:
-    candidates: list[tuple[float, str, dict]] = []
+    candidates: list[tuple[float, int, str, dict]] = []
     failures: list[str] = []
-    for profile in profiles:
-        result = await graphhopper.match_trace(observations, profile=profile)
+    for profile_index, profile in enumerate(profiles):
+        result = await graphhopper.match_trace(observations, profile=profile, gps_accuracy=gps_accuracy_m)
         if not result.get("available"):
             failures.append(f"{profile}: {result.get('reason', 'unavailable')}")
             continue
-        score = _mean_distance_to_matched_geometry(observations, result.get("geometry") or {})
-        candidates.append((score, profile, result))
+        score = _distance_score_to_matched_geometry(observations, result.get("geometry") or {})
+        candidates.append((score, profile_index, profile, result))
     if candidates:
         candidates.sort(key=lambda item: (item[0], item[1]))
-        selected_score, selected_profile, selected_result = candidates[0]
+        selected_score, _selected_index, selected_profile, selected_result = candidates[0]
         selected_result["profile_scores"] = {
             profile: round(score, 3)
-            for score, profile, _ in candidates
+            for score, _profile_index, profile, _ in candidates
+        }
+        selected_result["profile_geometries"] = {
+            profile: result.get("geometry")
+            for _score, _profile_index, profile, result in candidates
+            if isinstance(result.get("geometry"), dict)
         }
         selected_result["profile_score"] = round(selected_score, 3)
         selected_result["candidate_profiles"] = list(profiles)
@@ -1079,7 +1091,7 @@ async def _best_graphhopper_result(
     return "auto", {"available": False, "reason": "; ".join(failures[:3]) or "No GraphHopper profile matched"}
 
 
-def _mean_distance_to_matched_geometry(observations: list[dict], geometry: dict) -> float:
+def _distance_score_to_matched_geometry(observations: list[dict], geometry: dict) -> float:
     snapped = _nearest_points_on_linestring(observations, geometry)
     if not snapped:
         return float("inf")
@@ -1087,7 +1099,14 @@ def _mean_distance_to_matched_geometry(observations: list[dict], geometry: dict)
         _haversine_m(row["lon"], row["lat"], point[0], point[1])
         for row, point in zip(observations, snapped)
     ]
-    return sum(distances) / len(distances) if distances else float("inf")
+    if not distances:
+        return float("inf")
+    distances_sorted = sorted(distances)
+    p90_index = min(len(distances_sorted) - 1, int(round((len(distances_sorted) - 1) * 0.9)))
+    mean_distance = sum(distances) / len(distances)
+    p90_distance = distances_sorted[p90_index]
+    max_distance = distances_sorted[-1]
+    return mean_distance + 0.5 * p90_distance + 0.1 * max_distance
 
 
 def _graphhopper_map_matching_layers(
@@ -1149,11 +1168,26 @@ def _graphhopper_map_matching_layers(
             },
         }
 
-    matched_geometry = graphhopper_result["geometry"]
+    selected_matched_geometry = graphhopper_result["geometry"]
     snapped_waypoints = _snapped_waypoint_coordinates(graphhopper_result)
-    blue_line_waypoints = _nearest_points_on_linestring(observations, matched_geometry)
+    blue_line_waypoints = _nearest_points_on_linestring(observations, selected_matched_geometry)
     if not snapped_waypoints:
         snapped_waypoints = blue_line_waypoints
+    projection_profiles: list[str | None] = []
+    matched_geometry = selected_matched_geometry
+    matched_kind = "graphhopper_matched"
+    display_profile = profile
+    profile_geometries = graphhopper_result.get("profile_geometries")
+    if use_visual_user_type and isinstance(profile_geometries, dict) and len(profile_geometries) > 1:
+        mixed_waypoints, projection_profiles = _nearest_points_on_profile_linestrings(
+            observations,
+            profile_geometries,
+        )
+        if len(mixed_waypoints) == len(observations):
+            blue_line_waypoints = mixed_waypoints
+            matched_geometry = {"type": "LineString", "coordinates": mixed_waypoints}
+            matched_kind = "mixed_profile_projection"
+            display_profile = "mixed"
     point_features = []
     link_features = []
     road_features_by_id: dict[str, dict] = {}
@@ -1206,7 +1240,13 @@ def _graphhopper_map_matching_layers(
         snap_properties["mapillary_geometry"] = observation.get("mapillary_geometry")
         snap_properties["mapmatched_geometry"] = mapmatched_geometry
         snap_properties["mapmatched_source"] = "graphhopper_matched_trajectory_projection"
-        snap_properties["profile"] = profile
+        snap_properties["profile"] = display_profile
+        snap_properties["base_profile"] = profile
+        snap_properties["projection_profile"] = (
+            projection_profiles[index]
+            if index < len(projection_profiles)
+            else profile
+        )
         snap_properties["user_type"] = user_type
         snap_properties["user_type_votes"] = user_type_votes or {}
         snap_properties["user_type_status"] = user_type_status or {}
@@ -1255,9 +1295,11 @@ def _graphhopper_map_matching_layers(
                         "geometry": matched_geometry,
                         "properties": {
                             "kind": "graphhopper_matched",
+                            "match_kind": matched_kind,
                             "sequence_id": sequence_id,
                             "segment_index": segment_index,
-                            "profile": profile,
+                            "profile": display_profile,
+                            "base_profile": profile,
                             "user_type": user_type,
                             "user_type_votes": user_type_votes or {},
                             "user_type_status": user_type_status or {},
@@ -1277,7 +1319,9 @@ def _graphhopper_map_matching_layers(
             "count": len(observations),
             "matched": len(point_features),
             "sequence_id": sequence_id,
-            "profile": profile,
+            "profile": display_profile,
+            "base_profile": profile,
+            "match_kind": matched_kind,
             "user_type": user_type,
             "user_type_votes": user_type_votes or {},
             "user_type_status": user_type_status or {},
@@ -1367,6 +1411,41 @@ def _snapped_waypoint_coordinates(graphhopper_result: dict) -> list[list[float]]
         coordinates = geometry.get("coordinates")
         return coordinates if isinstance(coordinates, list) else []
     return []
+
+
+def _nearest_points_on_profile_linestrings(
+    observations: list[dict],
+    profile_geometries: dict,
+) -> tuple[list[list[float]], list[str | None]]:
+    waypoints: list[list[float]] = []
+    profiles: list[str | None] = []
+    valid_geometries = [
+        (str(profile), geometry)
+        for profile, geometry in profile_geometries.items()
+        if isinstance(geometry, dict) and geometry.get("type") == "LineString"
+    ]
+    if not valid_geometries:
+        return waypoints, profiles
+    for row in observations:
+        lon = float(row["lon"])
+        lat = float(row["lat"])
+        best_point: list[float] | None = None
+        best_profile: str | None = None
+        best_distance = float("inf")
+        for profile, geometry in valid_geometries:
+            coordinates = geometry.get("coordinates")
+            if not isinstance(coordinates, list) or len(coordinates) < 2:
+                continue
+            point = _nearest_point_on_polyline(lon, lat, coordinates)
+            distance = _haversine_m(lon, lat, point[0], point[1])
+            if distance < best_distance:
+                best_distance = distance
+                best_point = point
+                best_profile = profile
+        if best_point is not None:
+            waypoints.append(best_point)
+            profiles.append(best_profile)
+    return waypoints, profiles
 
 
 def _nearest_points_on_linestring(observations: list[dict], geometry: dict) -> list[list[float]]:

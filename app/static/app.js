@@ -1045,14 +1045,15 @@ async function runMapMatchingForCurrentGrid(useVisualUserType = true) {
     : "";
   const sequenceParam = selectedSequence ? `&sequence_id=${encodeURIComponent(selectedSequence)}` : "";
   const visualParam = `&use_visual_user_type=${useVisualUserType ? "true" : "false"}`;
+  const gpsAccuracyParam = "&gps_accuracy_m=6";
   if (mapMatchingStatusElement) {
     mapMatchingStatusElement.classList.remove("error");
     mapMatchingStatusElement.textContent = useVisualUserType
-      ? "正在按视觉信息判断交通使用者，并进行 GraphHopper map matching…"
+      ? "正在按 capture_position 判断轨迹类型，并允许 foot/bike/car 按几何距离竞争…"
       : "正在直接进行几何 map matching；本次不考虑视觉识别信息…";
   }
   try {
-    const result = await apiGet(`/api/grids/${encodeURIComponent(gridId)}/map-matching?limit=1000${sequenceParam}${visualParam}`);
+    const result = await apiGet(`/api/grids/${encodeURIComponent(gridId)}/map-matching?limit=1000${sequenceParam}${visualParam}${gpsAccuracyParam}`);
     if (sequence !== mapMatchingSequence) return;
     clearMapMatching();
     currentConfirmedMapMatchingPointFeatures = [];
@@ -1093,7 +1094,7 @@ async function runMapMatchingForCurrentGrid(useVisualUserType = true) {
     const selectedSegmentText = currentMapMatchingSegmentSummaries.length > 1
       ? ` 当前显示 segment ${currentMapMatchingSelectedSegment}，可在列表中切换后分别确认/处理。`
       : "";
-    const modeText = useVisualUserType ? "按视觉信息" : "直接几何";
+    const modeText = useVisualUserType ? "按 capture_position" : "直接几何";
     const message = `GraphHopper ${modeText} map matching 完成：sequence ${result.meta.sequence_id || "unknown"}，${result.meta.matched}/${result.meta.count} 个点${cacheText}，蓝色 matched 轨迹 ${matchedCount}${segmentText}${distanceText}。${selectedSegmentText}请检查预览点，确认后再保存位置。`;
     mapDataStatusElement.textContent = message;
     if (mapMatchingStatusElement) {

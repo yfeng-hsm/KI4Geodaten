@@ -229,6 +229,8 @@ async def map_matching_for_grid(
     limit: int = Query(default=500, ge=2, le=1000),
     sequence_id: str | None = Query(default=None),
     max_gap_m: float = Query(default=40.0, ge=5.0, le=500.0),
+    sequence_expand_radius: int = Query(default=1, ge=0, le=3),
+    use_visual_user_type: bool = Query(default=True),
 ) -> dict:
     try:
         cell = cell_from_id(grid_id)
@@ -248,10 +250,17 @@ async def map_matching_for_grid(
     cell_observations = _map_matching_observations(cached.get("features", []), cell_vlm_results)
     selected_sequence_id = _select_mapillary_sequence_id(cell_observations, sequence_id=sequence_id)
     if selected_sequence_id:
+        sequence_cache_meta = await _ensure_neighbor_sequence_cache(
+            request.app.state.mapillary,
+            cell,
+            selected_sequence_id,
+            radius=sequence_expand_radius,
+        )
         sequence_cached = request.app.state.mapillary.cached_images_for_sequence(selected_sequence_id)
         vlm_results = request.app.state.vlm_store.all_results(limit=50000).get("results", {})
         observations = _map_matching_observations(sequence_cached.get("features", []), vlm_results)
     else:
+        sequence_cache_meta = None
         sequence_cached = None
         observations = cell_observations
     selected_sequence = _select_mapillary_sequence(
@@ -284,6 +293,7 @@ async def map_matching_for_grid(
         request.app.state.osm,
         sequence_id=str(selected_sequence[0].get("sequence_id") or "unknown"),
         max_gap_m=max_gap_m,
+        use_visual_user_type=use_visual_user_type,
     )
     result["grid_id"] = grid_id
     result["meta"]["cell_count"] = len(cell_observations)
@@ -292,6 +302,9 @@ async def map_matching_for_grid(
     if sequence_cached is not None:
         result["meta"]["sequence_cached_count"] = sequence_cached.get("meta", {}).get("count", len(observations))
         result["meta"]["sequence_cached_grid_count"] = sequence_cached.get("meta", {}).get("grid_count")
+    if sequence_cache_meta is not None:
+        result["meta"]["sequence_cache_expand"] = sequence_cache_meta
+    result["meta"]["use_visual_user_type"] = use_visual_user_type
     return result
 
 
@@ -574,6 +587,42 @@ def _empty_map_matching_layers() -> dict:
     }
 
 
+async def _ensure_neighbor_sequence_cache(
+    mapillary: MapillaryClient,
+    center_cell,
+    sequence_id: str,
+    *,
+    radius: int,
+) -> dict:
+    if radius <= 0:
+        return {"radius": 0, "checked_cells": 0, "fetched_cells": 0, "failed_cells": []}
+    checked = 0
+    fetched = 0
+    failed: list[dict[str, str]] = []
+    for neighbor in neighboring_cells(center_cell, radius):
+        if neighbor == center_cell:
+            continue
+        checked += 1
+        if mapillary.cached_images_for_cell(neighbor) is not None:
+            continue
+        try:
+            await mapillary.images_for_cell(neighbor, refresh=False)
+            fetched += 1
+        except (MapillaryConfigurationError, MapillaryAPIError) as exc:
+            failed.append({"grid_id": neighbor.grid_id, "error": str(exc)})
+        except Exception as exc:
+            failed.append({"grid_id": neighbor.grid_id, "error": str(exc)})
+    sequence_cached = mapillary.cached_images_for_sequence(sequence_id)
+    return {
+        "radius": radius,
+        "checked_cells": checked,
+        "fetched_cells": fetched,
+        "failed_cells": failed[:5],
+        "sequence_count_after_expand": sequence_cached.get("meta", {}).get("count", 0),
+        "sequence_grid_count_after_expand": sequence_cached.get("meta", {}).get("grid_count", 0),
+    }
+
+
 def _map_matching_observations(features: list[dict], vlm_results: dict) -> list[dict]:
     rows = []
     for feature in features:
@@ -732,6 +781,7 @@ async def _graphhopper_map_matching_segment_layers(
     *,
     sequence_id: str,
     max_gap_m: float,
+    use_visual_user_type: bool,
 ) -> dict:
     aggregate_layers = _empty_map_matching_layers()
     reasons: list[str] = []
@@ -763,7 +813,47 @@ async def _graphhopper_map_matching_segment_layers(
             )
             continue
 
-        profile, graphhopper_result = await _best_graphhopper_result(segment, graphhopper)
+        user_type, user_type_votes = _infer_trajectory_user_type(segment)
+        user_type_status = _trajectory_user_type_status(segment, user_type, user_type_votes)
+        if use_visual_user_type and not user_type_status["ready"]:
+            segment_result = _raw_map_matching_segment_layers(
+                segment,
+                segment_index=segment_index,
+                user_type=user_type,
+                user_type_votes=user_type_votes,
+                user_type_status=user_type_status,
+            )
+            for layer_name, layer in segment_result["layers"].items():
+                aggregate_layers[layer_name]["features"].extend(layer.get("features", []))
+            reasons.append(str(segment_result.get("reason") or "trajectory user type is not ready"))
+            segment_meta = segment_result.get("meta", {})
+            segment_summaries.append(
+                {
+                    "segment_index": segment_index,
+                    "count": len(segment),
+                    "matched": 0,
+                    "available": False,
+                    "profile": None,
+                    "user_type": segment_meta.get("user_type"),
+                    "user_type_votes": segment_meta.get("user_type_votes"),
+                    "user_type_status": segment_meta.get("user_type_status"),
+                    "candidate_profiles": segment_meta.get("candidate_profiles"),
+                    "distance": None,
+                    "start_captured_at": segment[0].get("captured_at") if segment else None,
+                    "end_captured_at": segment[-1].get("captured_at") if segment else None,
+                }
+            )
+            continue
+        candidate_profiles = (
+            _candidate_graphhopper_profiles(user_type)
+            if use_visual_user_type
+            else ("foot", "bike", "car")
+        )
+        profile, graphhopper_result = await _best_graphhopper_result(
+            segment,
+            graphhopper,
+            profiles=candidate_profiles,
+        )
         segment_result = _graphhopper_map_matching_layers(
             segment,
             graphhopper_result,
@@ -771,6 +861,11 @@ async def _graphhopper_map_matching_segment_layers(
             osm_store=osm_store,
             segment_index=segment_index,
             max_gap_m=max_gap_m,
+            user_type=user_type,
+            user_type_votes=user_type_votes,
+            user_type_status=user_type_status,
+            candidate_profiles=candidate_profiles,
+            use_visual_user_type=use_visual_user_type,
         )
         for layer_name, layer in segment_result["layers"].items():
             aggregate_layers[layer_name]["features"].extend(layer.get("features", []))
@@ -791,6 +886,10 @@ async def _graphhopper_map_matching_segment_layers(
                 "matched": int(segment_meta.get("matched") or 0),
                 "available": bool(segment_result.get("available")),
                 "profile": segment_meta.get("profile"),
+                "user_type": segment_meta.get("user_type"),
+                "user_type_votes": segment_meta.get("user_type_votes"),
+                "user_type_status": segment_meta.get("user_type_status"),
+                "candidate_profiles": segment_meta.get("candidate_profiles"),
                 "distance": segment_meta.get("distance"),
                 "start_captured_at": segment[0].get("captured_at") if segment else None,
                 "end_captured_at": segment[-1].get("captured_at") if segment else None,
@@ -813,6 +912,140 @@ async def _graphhopper_map_matching_segment_layers(
             "matched_segments": matched_segments,
             "segment_summaries": segment_summaries,
             "max_gap_m": max_gap_m,
+            "use_visual_user_type": use_visual_user_type,
+            "method": "graphhopper_sequence_map_matching",
+        },
+    }
+
+
+def _infer_trajectory_user_type(observations: list[dict]) -> tuple[str, dict[str, int]]:
+    votes = {"car": 0, "bike": 0, "foot": 0}
+    for observation in observations:
+        capture_position = observation.get("capture_position")
+        if capture_position == "vehicle_road":
+            votes["car"] += 1
+        elif capture_position == "bicycle_road":
+            votes["bike"] += 1
+        elif capture_position == "pedestrian_road":
+            votes["foot"] += 1
+    if not any(votes.values()):
+        return "unknown", votes
+    user_type = _winning_user_type(votes)
+    return user_type, votes
+
+
+def _trajectory_user_type_status(
+    observations: list[dict],
+    user_type: str,
+    votes: dict[str, int],
+    *,
+    min_coverage_ratio: float = 0.4,
+    min_winner_ratio: float = 0.6,
+    min_votes: int = 3,
+) -> dict:
+    total = len(observations)
+    voted = sum(votes.values())
+    winner_votes = votes.get(user_type, 0) if user_type != "unknown" else 0
+    coverage_ratio = voted / total if total else 0.0
+    winner_ratio = winner_votes / voted if voted else 0.0
+    ready = bool(
+        user_type != "unknown"
+        and winner_votes >= min(min_votes, total)
+        and coverage_ratio >= min_coverage_ratio
+        and winner_ratio >= min_winner_ratio
+    )
+    return {
+        "ready": ready,
+        "user_type": user_type,
+        "votes": votes,
+        "voted": voted,
+        "total": total,
+        "winner_votes": winner_votes,
+        "coverage_ratio": round(coverage_ratio, 3),
+        "winner_ratio": round(winner_ratio, 3),
+        "min_coverage_ratio": min_coverage_ratio,
+        "min_winner_ratio": min_winner_ratio,
+        "min_votes": min_votes,
+    }
+
+
+def _winning_user_type(votes: dict[str, int]) -> str:
+    priority = {"car": 0, "bike": 1, "foot": 2}
+    return sorted(votes.items(), key=lambda item: (-item[1], priority.get(item[0], 99)))[0][0]
+
+
+def _candidate_graphhopper_profiles(user_type: str) -> tuple[str, ...]:
+    if user_type == "car":
+        return ("car",)
+    if user_type == "bike":
+        return ("foot", "bike")
+    if user_type == "foot":
+        return ("foot",)
+    return ("foot", "bike", "car")
+
+
+def _raw_map_matching_segment_layers(
+    observations: list[dict],
+    *,
+    segment_index: int,
+    user_type: str,
+    user_type_votes: dict[str, int],
+    user_type_status: dict,
+) -> dict:
+    sequence_id = str(observations[0].get("sequence_id") or "unknown")
+    extra_properties = {
+        "user_type": user_type,
+        "user_type_votes": user_type_votes,
+        "user_type_status": user_type_status,
+        "candidate_profiles": [],
+        "mapmatched_source": None,
+    }
+    raw_points = [
+        _map_matching_point_feature(
+            observation,
+            None,
+            segment_index=segment_index,
+            extra_properties=extra_properties,
+        )
+        for observation in observations
+    ]
+    raw_trajectory = _line_feature(
+        f"mapillary-sequence-raw/{segment_index}",
+        [[row["lon"], row["lat"]] for row in observations],
+        {
+            "kind": "raw_gps_sequence",
+            "sequence_id": sequence_id,
+            "segment_index": segment_index,
+            "user_type": user_type,
+            "user_type_votes": user_type_votes,
+            "user_type_status": user_type_status,
+            "candidate_profiles": [],
+        },
+    )
+    reason = (
+        "trajectory user type is not ready: "
+        f"{user_type_status['winner_votes']}/{user_type_status['total']} "
+        f"({user_type_status['coverage_ratio']:.0%}) usable capture_position votes"
+    )
+    return {
+        "available": False,
+        "reason": reason,
+        "layers": {
+            "points": {"type": "FeatureCollection", "features": raw_points},
+            "links": {"type": "FeatureCollection", "features": []},
+            "matched_roads": {"type": "FeatureCollection", "features": []},
+            "raw_trajectory": {"type": "FeatureCollection", "features": [raw_trajectory] if raw_trajectory else []},
+            "matched_trajectory": {"type": "FeatureCollection", "features": []},
+        },
+        "meta": {
+            "count": len(observations),
+            "matched": 0,
+            "sequence_id": sequence_id,
+            "profile": None,
+            "user_type": user_type,
+            "user_type_votes": user_type_votes,
+            "user_type_status": user_type_status,
+            "candidate_profiles": [],
             "method": "graphhopper_sequence_map_matching",
         },
     }
@@ -821,10 +1054,12 @@ async def _graphhopper_map_matching_segment_layers(
 async def _best_graphhopper_result(
     observations: list[dict],
     graphhopper: GraphHopperClient,
+    *,
+    profiles: tuple[str, ...] = ("foot", "bike", "car"),
 ) -> tuple[str, dict]:
     candidates: list[tuple[float, str, dict]] = []
     failures: list[str] = []
-    for profile in ("foot", "bike", "car"):
+    for profile in profiles:
         result = await graphhopper.match_trace(observations, profile=profile)
         if not result.get("available"):
             failures.append(f"{profile}: {result.get('reason', 'unavailable')}")
@@ -839,6 +1074,7 @@ async def _best_graphhopper_result(
             for score, profile, _ in candidates
         }
         selected_result["profile_score"] = round(selected_score, 3)
+        selected_result["candidate_profiles"] = list(profiles)
         return selected_profile, selected_result
     return "auto", {"available": False, "reason": "; ".join(failures[:3]) or "No GraphHopper profile matched"}
 
@@ -862,6 +1098,11 @@ def _graphhopper_map_matching_layers(
     osm_store: OSMStore | None = None,
     segment_index: int = 0,
     max_gap_m: float = 40.0,
+    user_type: str = "unknown",
+    user_type_votes: dict[str, int] | None = None,
+    user_type_status: dict | None = None,
+    candidate_profiles: tuple[str, ...] = ("foot", "bike", "car"),
+    use_visual_user_type: bool = True,
 ) -> dict:
     sequence_id = str(observations[0].get("sequence_id") or "unknown")
     raw_points = [
@@ -872,6 +1113,16 @@ def _graphhopper_map_matching_layers(
         f"mapillary-sequence-raw/{segment_index}",
         [[row["lon"], row["lat"]] for row in observations],
         {"kind": "raw_gps_sequence", "sequence_id": sequence_id, "segment_index": segment_index},
+    )
+    raw_trajectory_properties = raw_trajectory.get("properties", {}) if raw_trajectory else {}
+    raw_trajectory_properties.update(
+        {
+            "user_type": user_type,
+            "user_type_votes": user_type_votes or {},
+            "user_type_status": user_type_status or {},
+            "candidate_profiles": list(candidate_profiles),
+            "use_visual_user_type": use_visual_user_type,
+        }
     )
     if not graphhopper_result.get("available"):
         return {
@@ -889,6 +1140,11 @@ def _graphhopper_map_matching_layers(
                 "matched": 0,
                 "sequence_id": sequence_id,
                 "profile": profile,
+                "user_type": user_type,
+                "user_type_votes": user_type_votes or {},
+                "user_type_status": user_type_status or {},
+                "candidate_profiles": list(candidate_profiles),
+                "use_visual_user_type": use_visual_user_type,
                 "method": "graphhopper_sequence_map_matching",
             },
         }
@@ -951,6 +1207,11 @@ def _graphhopper_map_matching_layers(
         snap_properties["mapmatched_geometry"] = mapmatched_geometry
         snap_properties["mapmatched_source"] = "graphhopper_matched_trajectory_projection"
         snap_properties["profile"] = profile
+        snap_properties["user_type"] = user_type
+        snap_properties["user_type_votes"] = user_type_votes or {}
+        snap_properties["user_type_status"] = user_type_status or {}
+        snap_properties["candidate_profiles"] = list(candidate_profiles)
+        snap_properties["use_visual_user_type"] = use_visual_user_type
         point_features.append(
             _map_matching_point_feature(
                 observation,
@@ -997,6 +1258,11 @@ def _graphhopper_map_matching_layers(
                             "sequence_id": sequence_id,
                             "segment_index": segment_index,
                             "profile": profile,
+                            "user_type": user_type,
+                            "user_type_votes": user_type_votes or {},
+                            "user_type_status": user_type_status or {},
+                            "candidate_profiles": list(candidate_profiles),
+                            "use_visual_user_type": use_visual_user_type,
                             "distance": graphhopper_result.get("distance"),
                             "time": graphhopper_result.get("time"),
                             "local_override_count": local_override_count,
@@ -1012,6 +1278,11 @@ def _graphhopper_map_matching_layers(
             "matched": len(point_features),
             "sequence_id": sequence_id,
             "profile": profile,
+            "user_type": user_type,
+            "user_type_votes": user_type_votes or {},
+            "user_type_status": user_type_status or {},
+            "candidate_profiles": list(candidate_profiles),
+            "use_visual_user_type": use_visual_user_type,
             "distance": graphhopper_result.get("distance"),
             "time": graphhopper_result.get("time"),
             "local_override_count": local_override_count,

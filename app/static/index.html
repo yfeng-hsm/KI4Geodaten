@@ -90,12 +90,13 @@
               <select id="map-matching-sequence-select" disabled>
                 <option value="">先加载 Mapillary 图像</option>
               </select>
-              <button id="run-graphhopper-matching-button" type="button" disabled>运行当前 cell Mapillary 轨迹匹配</button>
+              <button id="run-graphhopper-direct-button" type="button" disabled>直接 map matching</button>
+              <button id="run-graphhopper-matching-button" type="button" disabled>按视觉信息 map matching</button>
               <select id="map-matching-segment-select" disabled>
                 <option value="">先运行轨迹匹配</option>
               </select>
               <button id="confirm-current-mapmatching-button" type="button" disabled>确认保存当前匹配点</button>
-              <button id="process-current-trajectory-vlm-button" type="button" disabled>Process 已确认轨迹图片</button>
+              <button id="process-current-trajectory-vlm-button" type="button" disabled>Process 当前子轨迹图片</button>
               <p id="map-matching-status" class="muted">加载当前 cell 的 Mapillary 图像后，可以手动组织 sequence 并运行 GraphHopper。</p>
             </div>
           </div>

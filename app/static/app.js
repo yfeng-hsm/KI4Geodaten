@@ -363,27 +363,27 @@ const mapMatchRawTrajectoryLayer = L.geoJSON(null, {
   pane: "roadMatchPane",
   renderer: roadMatchRenderer,
   interactive: false,
-  style: {
-    color: "#f08c00",
+  style: (feature) => ({
+    color: mapMatchTrajectoryColor(feature, "#f08c00"),
     weight: 4.2,
     opacity: 0.9,
     dashArray: "8 7",
     lineCap: "round",
     lineJoin: "round",
-  },
+  }),
 }).addTo(map);
 
 const mapMatchMatchedTrajectoryLayer = L.geoJSON(null, {
   pane: "roadMatchPane",
   renderer: roadMatchRenderer,
   interactive: false,
-  style: {
-    color: "#1c7ed6",
+  style: (feature) => ({
+    color: mapMatchTrajectoryColor(feature, "#1c7ed6"),
     weight: 6.5,
     opacity: 0.94,
     lineCap: "round",
     lineJoin: "round",
-  },
+  }),
 }).addTo(map);
 
 const mapMatchLinkLayer = L.geoJSON(null, {
@@ -492,6 +492,7 @@ const validateRoadSurfaceButton = document.getElementById("validate-road-surface
 const surfaceValidationProgress = document.getElementById("surface-validation-progress");
 const surfaceValidationStatus = document.getElementById("surface-validation-status");
 const mapMatchingSequenceSelect = document.getElementById("map-matching-sequence-select");
+const runGraphhopperDirectButton = document.getElementById("run-graphhopper-direct-button");
 const runGraphhopperMatchingButton = document.getElementById("run-graphhopper-matching-button");
 const mapMatchingSegmentSelect = document.getElementById("map-matching-segment-select");
 const confirmCurrentMapMatchingButton = document.getElementById("confirm-current-mapmatching-button");
@@ -830,22 +831,29 @@ function resetMapMatchingControls() {
 }
 
 function updateMapMatchingButtonState() {
-  if (!runGraphhopperMatchingButton) return;
-  runGraphhopperMatchingButton.disabled = mapMatchingRunning || !currentGrid || currentImageFeatures.length < 2;
+  const hasSequence = currentImageFeatures.some((feature) => String(feature.properties?.sequence_id || "").trim());
+  const runDisabled = mapMatchingRunning || !currentGrid || !hasSequence;
+  if (runGraphhopperDirectButton) runGraphhopperDirectButton.disabled = runDisabled;
+  if (runGraphhopperMatchingButton) runGraphhopperMatchingButton.disabled = runDisabled;
+  const hasMapmatchedPreview = currentMapMatchingPointFeatures.some((feature) => (
+    feature.properties?.mapmatched_geometry?.coordinates
+  ));
   if (confirmCurrentMapMatchingButton) {
     confirmCurrentMapMatchingButton.disabled = Boolean(
       mapMatchingRunning
       || !currentGrid
-      || currentMapMatchingPointFeatures.length === 0
+      || !hasMapmatchedPreview
     );
   }
   if (processCurrentTrajectoryVlmButton) {
+    const hasTrajectoryImages = currentMapMatchingPointFeatures.length > 0
+      || currentConfirmedMapMatchingPointFeatures.length > 0;
     processCurrentTrajectoryVlmButton.disabled = Boolean(
       mapMatchingRunning
       || !currentGrid
       || !ollamaReady
       || activeVlmJobId
-      || currentConfirmedMapMatchingPointFeatures.length === 0
+      || !hasTrajectoryImages
     );
   }
 }
@@ -874,12 +882,20 @@ function updateMapMatchingSegmentOptions() {
     option.value = String(segmentIndex);
     const distance = summary.distance == null ? "" : ` · ${(Number(summary.distance) / 1000).toFixed(2)} km`;
     const profile = summary.profile ? ` · ${summary.profile}` : "";
+    const userType = summary.user_type ? ` · ${summary.user_type}` : "";
+    const candidateProfiles = Array.isArray(summary.candidate_profiles) && summary.candidate_profiles.length
+      ? ` · candidates ${summary.candidate_profiles.join("/")}`
+      : "";
+    const typeStatus = summary.user_type_status || {};
+    const typeText = typeStatus.total
+      ? ` · type ${Number(typeStatus.winner_votes || 0)}/${Number(typeStatus.total || 0)} (${((Number(typeStatus.coverage_ratio || 0)) * 100).toFixed(0)}%)`
+      : "";
     const status = summary.available === false ? " · 未匹配" : "";
     const confirmed = confirmedSegmentStatus(segmentIndex);
     const confirmedText = confirmed.total > 0
       ? ` · 已确认 ${confirmed.confirmed}/${confirmed.total}`
       : " · 未确认";
-    option.textContent = `segment ${segmentIndex} · ${summary.matched ?? 0}/${summary.count ?? 0} 点${profile}${distance}${status}${confirmedText}`;
+    option.textContent = `segment ${segmentIndex} · ${summary.matched ?? 0}/${summary.count ?? 0} 点${userType}${typeText}${profile}${candidateProfiles}${distance}${status}${confirmedText}`;
     mapMatchingSegmentSelect.append(option);
   });
   mapMatchingSegmentSelect.disabled = false;
@@ -922,6 +938,10 @@ function summarizeMapMatchingSegments(layers) {
       matched: 0,
       available: false,
       profile: properties.profile || null,
+      user_type: properties.user_type || null,
+      user_type_votes: properties.user_type_votes || null,
+      user_type_status: properties.user_type_status || null,
+      candidate_profiles: properties.candidate_profiles || null,
       distance: null,
     };
     summary.count += 1;
@@ -930,6 +950,10 @@ function summarizeMapMatchingSegments(layers) {
       summary.available = true;
     }
     if (!summary.profile && properties.profile) summary.profile = properties.profile;
+    if (!summary.user_type && properties.user_type) summary.user_type = properties.user_type;
+    if (!summary.user_type_votes && properties.user_type_votes) summary.user_type_votes = properties.user_type_votes;
+    if (!summary.user_type_status && properties.user_type_status) summary.user_type_status = properties.user_type_status;
+    if (!summary.candidate_profiles && properties.candidate_profiles) summary.candidate_profiles = properties.candidate_profiles;
     groups.set(segmentIndex, summary);
   });
   return Array.from(groups.values()).sort((a, b) => Number(a.segment_index) - Number(b.segment_index));
@@ -949,8 +973,7 @@ function renderSelectedMapMatchingSegment() {
   mapMatchLinkLayer.addData(filterFeaturesBySegment(layers.links, segmentIndex));
   const selectedPoints = filterFeaturesBySegment(layers.points, segmentIndex);
   mapMatchPointLayer.addData(selectedPoints);
-  currentMapMatchingPointFeatures = (selectedPoints.features || [])
-    .filter((feature) => feature.properties?.mapmatched_geometry?.coordinates);
+  currentMapMatchingPointFeatures = selectedPoints.features || [];
   mapMatchRawTrajectoryLayer.bringToFront();
   mapMatchMatchedTrajectoryLayer.bringToFront();
   mapMatchLinkLayer.bringToFront();
@@ -998,8 +1021,7 @@ function updateMapMatchingSequenceOptions() {
   sorted.forEach(([sequenceId, features]) => {
     const option = document.createElement("option");
     option.value = sequenceId;
-    option.textContent = `${sequenceId} · ${features.length} 张`;
-    option.disabled = features.length < 2;
+    option.textContent = `${sequenceId} · 当前cell ${features.length} 张`;
     mapMatchingSequenceSelect.append(option);
   });
   mapMatchingSequenceSelect.disabled = false;
@@ -1010,7 +1032,7 @@ function updateMapMatchingSequenceOptions() {
   updateMapMatchingButtonState();
 }
 
-async function runMapMatchingForCurrentGrid() {
+async function runMapMatchingForCurrentGrid(useVisualUserType = true) {
   if (!currentGrid || mapMatchingRunning) return;
   const gridId = currentGrid.properties.grid_id;
   const sequence = ++mapMatchingSequence;
@@ -1022,12 +1044,15 @@ async function runMapMatchingForCurrentGrid() {
     ? mapMatchingSequenceSelect.value
     : "";
   const sequenceParam = selectedSequence ? `&sequence_id=${encodeURIComponent(selectedSequence)}` : "";
+  const visualParam = `&use_visual_user_type=${useVisualUserType ? "true" : "false"}`;
   if (mapMatchingStatusElement) {
     mapMatchingStatusElement.classList.remove("error");
-    mapMatchingStatusElement.textContent = "正在以当前 cell 选择 sequence，并从本地缓存扩展整条轨迹发送到 GraphHopper…";
+    mapMatchingStatusElement.textContent = useVisualUserType
+      ? "正在按视觉信息判断交通使用者，并进行 GraphHopper map matching…"
+      : "正在直接进行几何 map matching；本次不考虑视觉识别信息…";
   }
   try {
-    const result = await apiGet(`/api/grids/${encodeURIComponent(gridId)}/map-matching?limit=1000${sequenceParam}`);
+    const result = await apiGet(`/api/grids/${encodeURIComponent(gridId)}/map-matching?limit=1000${sequenceParam}${visualParam}`);
     if (sequence !== mapMatchingSequence) return;
     clearMapMatching();
     currentConfirmedMapMatchingPointFeatures = [];
@@ -1039,12 +1064,19 @@ async function runMapMatchingForCurrentGrid() {
     const rawCount = (layers.raw_trajectory?.features || []).length;
     const matchedCount = (layers.matched_trajectory?.features || []).length;
     if (!result.available) {
-      const rawText = rawCount > 0 ? "已显示橙色原始 Mapillary sequence；" : "";
-      const message = `Map matching：${rawText}没有蓝色 matched 轨迹：${result.reason || "GraphHopper 不可用"}。`;
+      const hasProcessableRawTrajectory = useVisualUserType && rawCount > 0 && currentMapMatchingPointFeatures.length > 0;
+      const firstSummary = currentMapMatchingSegmentSummaries[0] || {};
+      const typeStatus = firstSummary.user_type_status || {};
+      const typeText = typeStatus.total
+        ? `当前类型票 ${Number(typeStatus.winner_votes || 0)}/${Number(typeStatus.total || 0)}，覆盖率 ${((Number(typeStatus.coverage_ratio || 0)) * 100).toFixed(0)}%，需要至少 ${((Number(typeStatus.min_coverage_ratio || 0.4)) * 100).toFixed(0)}%。`
+        : "";
+      const message = hasProcessableRawTrajectory
+        ? `已显示橙色原始子轨迹，还没有蓝色 matched 轨迹。${typeText}请先选择子轨迹并点击“Process 当前子轨迹图片”，处理完成后再次运行匹配。`
+        : `Map matching：没有蓝色 matched 轨迹：${result.reason || "GraphHopper 不可用"}。`;
       mapDataStatusElement.textContent = message;
       if (mapMatchingStatusElement) {
         mapMatchingStatusElement.textContent = message;
-        mapMatchingStatusElement.classList.add("error");
+        mapMatchingStatusElement.classList.toggle("error", !hasProcessableRawTrajectory);
       }
       zoomToMapMatchingResult();
       updateMapMatchingButtonState();
@@ -1061,7 +1093,8 @@ async function runMapMatchingForCurrentGrid() {
     const selectedSegmentText = currentMapMatchingSegmentSummaries.length > 1
       ? ` 当前显示 segment ${currentMapMatchingSelectedSegment}，可在列表中切换后分别确认/处理。`
       : "";
-    const message = `GraphHopper map matching 完成：sequence ${result.meta.sequence_id || "unknown"}，${result.meta.matched}/${result.meta.count} 个点${cacheText}，蓝色 matched 轨迹 ${matchedCount}${segmentText}${distanceText}。${selectedSegmentText}请检查预览点，确认后再保存位置。`;
+    const modeText = useVisualUserType ? "按视觉信息" : "直接几何";
+    const message = `GraphHopper ${modeText} map matching 完成：sequence ${result.meta.sequence_id || "unknown"}，${result.meta.matched}/${result.meta.count} 个点${cacheText}，蓝色 matched 轨迹 ${matchedCount}${segmentText}${distanceText}。${selectedSegmentText}请检查预览点，确认后再保存位置。`;
     mapDataStatusElement.textContent = message;
     if (mapMatchingStatusElement) {
       mapMatchingStatusElement.classList.remove("error");
@@ -1768,7 +1801,10 @@ function mapMatchedFeatureToVlmImage(feature) {
 
 function currentTrajectoryVlmImages() {
   const seen = new Set();
-  return currentConfirmedMapMatchingPointFeatures
+  const sourceFeatures = currentMapMatchingPointFeatures.length
+    ? currentMapMatchingPointFeatures
+    : currentConfirmedMapMatchingPointFeatures;
+  return sourceFeatures
     .slice()
     .sort((a, b) => (
       Number(a.properties?.segment_index ?? 0) - Number(b.properties?.segment_index ?? 0)
@@ -1783,12 +1819,12 @@ function currentTrajectoryVlmImages() {
 }
 
 async function startCurrentTrajectoryVlmJob() {
-  if (!currentGrid || activeVlmJobId || currentConfirmedMapMatchingPointFeatures.length === 0) return;
+  if (!currentGrid || activeVlmJobId) return;
   const imagesToProcess = currentTrajectoryVlmImages();
   if (imagesToProcess.length === 0) {
     if (mapMatchingStatusElement) {
       mapMatchingStatusElement.classList.add("error");
-      mapMatchingStatusElement.textContent = "当前还没有已确认保存的 map-matched 图像点。";
+      mapMatchingStatusElement.textContent = "当前还没有可处理的轨迹图像点。先运行轨迹拆分或选择一个子轨迹。";
     }
     return;
   }
@@ -1797,7 +1833,7 @@ async function startCurrentTrajectoryVlmJob() {
   resetVlmProgress(0, Math.max(imagesToProcess.length, 1));
   processCurrentTrajectoryVlmButton.disabled = true;
   vlmStatusElement.classList.remove("error");
-  vlmStatusElement.textContent = `正在把已确认轨迹 ${imagesToProcess.length} 张图片加入当前 cell 的 VLM 队列；已有结果会更新位置元数据，不重复调用模型。`;
+  vlmStatusElement.textContent = `正在把当前子轨迹 ${imagesToProcess.length} 张图片加入当前 cell 的 VLM 队列；已有结果会更新位置元数据，不重复调用模型。`;
 
   try {
     const job = await apiPost(`/api/grids/${encodeURIComponent(gridId)}/vlm-jobs`, {
@@ -1822,6 +1858,7 @@ async function confirmCurrentMapMatching() {
   if (!currentGrid || currentMapMatchingPointFeatures.length === 0 || mapMatchingRunning) return;
   const gridId = currentGrid.properties.grid_id;
   const features = currentMapMatchingPointFeatures
+    .filter((feature) => feature.properties?.mapmatched_geometry?.coordinates)
     .map(mapMatchedFeatureToVlmImage)
     .filter(Boolean);
   if (features.length === 0) {
@@ -1841,7 +1878,7 @@ async function confirmCurrentMapMatching() {
     updateMapMatchingSegmentOptions();
     if (!map.hasLayer(confirmedMapMatchedPointLayer)) map.addLayer(confirmedMapMatchedPointLayer);
     confirmedMapMatchedPointLayer.bringToFront();
-    mapMatchingStatusElement.textContent = `已确认保存 ${result.count || currentConfirmedMapMatchingPointFeatures.length} 个 map-matched 点；现在可以点击 Process 已确认轨迹图片。`;
+    mapMatchingStatusElement.textContent = `已确认保存 ${result.count || currentConfirmedMapMatchingPointFeatures.length} 个 map-matched 点；也可以继续点击 Process 当前子轨迹图片更新 VLM 字段。`;
     updateMapMatchingButtonState();
   } catch (error) {
     mapMatchingStatusElement.textContent = `保存确认匹配点失败：${error.message}`;
@@ -2426,6 +2463,9 @@ function vlmThemeColor(value) {
     vehicle_road: "#e03131",
     pedestrian_road: "#9c36b5",
     bicycle_road: "#087f5b",
+    car: "#e03131",
+    pedestrian: "#9c36b5",
+    bicycle: "#087f5b",
     other_location: "#495057",
     transit_vehicle: "#7048e8",
     poor_image_quality: "#e8590c",
@@ -2492,6 +2532,22 @@ function mapMatchColor(capturePosition) {
   return "#495057";
 }
 
+function mapMatchTrajectoryColor(feature, fallback) {
+  const properties = feature?.properties || {};
+  let value = null;
+  if (selectedVlmTheme === "capture_position") {
+    value = mapMatchingUserTypeToCapturePositionValue(properties.user_type);
+  }
+  return value ? vlmThemeColor(value) : fallback;
+}
+
+function mapMatchingUserTypeToCapturePositionValue(userType) {
+  if (userType === "car") return "vehicle_road";
+  if (userType === "bike") return "bicycle_road";
+  if (userType === "foot") return "pedestrian_road";
+  return null;
+}
+
 function roadWeight(category) {
   const zoomBoost = map.getZoom() >= 17 ? 1.4 : 1;
   if (category === "vehicle") return 3.2 * zoomBoost;
@@ -2534,7 +2590,8 @@ processCellVlmButton.addEventListener("click", startCellVlmJob);
 processCurrentImageButton.addEventListener("click", startCurrentImageVlmJob);
 deleteCellVlmButton?.addEventListener("click", deleteCurrentCellVlmResults);
 validateRoadSurfaceButton?.addEventListener("click", runRoadSurfaceValidation);
-runGraphhopperMatchingButton?.addEventListener("click", runMapMatchingForCurrentGrid);
+runGraphhopperDirectButton?.addEventListener("click", () => runMapMatchingForCurrentGrid(false));
+runGraphhopperMatchingButton?.addEventListener("click", () => runMapMatchingForCurrentGrid(true));
 confirmCurrentMapMatchingButton?.addEventListener("click", confirmCurrentMapMatching);
 processCurrentTrajectoryVlmButton?.addEventListener("click", startCurrentTrajectoryVlmJob);
 mapMatchingSegmentSelect?.addEventListener("change", () => {
@@ -2543,7 +2600,12 @@ mapMatchingSegmentSelect?.addEventListener("change", () => {
   renderSelectedMapMatchingSegment();
   if (mapMatchingStatusElement) {
     mapMatchingStatusElement.classList.remove("error");
-    mapMatchingStatusElement.textContent = `当前显示 segment ${currentMapMatchingSelectedSegment}。请检查这一段，确认保存后再单独 process。`;
+    const hasMapmatchedPreview = currentMapMatchingPointFeatures.some((feature) => (
+      feature.properties?.mapmatched_geometry?.coordinates
+    ));
+    mapMatchingStatusElement.textContent = hasMapmatchedPreview
+      ? `当前显示 segment ${currentMapMatchingSelectedSegment}。请检查这一段，确认保存后可继续 process。`
+      : `当前显示 raw segment ${currentMapMatchingSelectedSegment}。请先点击“Process 当前子轨迹图片”，类型票达标后再次运行匹配。`;
   }
 });
 imageDetailElement.addEventListener("click", (event) => {
@@ -2591,6 +2653,21 @@ vlmThemeSelect.addEventListener("change", () => {
     : "capture_position";
   scheduleVlmResultLayerRender();
   renderConfirmedMapMatchedPointLayer();
+  mapMatchRawTrajectoryLayer.setStyle((feature) => ({
+    color: mapMatchTrajectoryColor(feature, "#f08c00"),
+    weight: 4.2,
+    opacity: 0.9,
+    dashArray: "8 7",
+    lineCap: "round",
+    lineJoin: "round",
+  }));
+  mapMatchMatchedTrajectoryLayer.setStyle((feature) => ({
+    color: mapMatchTrajectoryColor(feature, "#1c7ed6"),
+    weight: 6.5,
+    opacity: 0.94,
+    lineCap: "round",
+    lineJoin: "round",
+  }));
 });
 map.on("zoomend", () => {
   [pedestrianRoadLayer, vehicleRoadLayer, bicycleRoadLayer].forEach((layer) => {

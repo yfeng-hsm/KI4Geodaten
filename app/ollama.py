@@ -135,7 +135,7 @@ VLM_PROMPT = """
 - yes/no/uncertain 字段无法判断时必须返回 uncertain。
 """.strip()
 
-PROMPT_VERSION = "street-position-surface-assets-sidewalk-adjacent-quality-v13"
+PROMPT_VERSION = "street-position-surface-assets-sidewalk-adjacent-quality-v15"
 
 
 class OllamaConfigurationError(RuntimeError):

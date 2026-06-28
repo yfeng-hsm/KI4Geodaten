@@ -79,6 +79,34 @@ class CensusGridCell:
             },
         }
 
+    def neighborhood_feature(self, radius: int) -> dict:
+        if not 0 <= radius <= 10:
+            raise ValueError("Grid radius must be between 0 and 10")
+        west = self.east - radius * GRID_SIZE_METERS
+        south = self.north - radius * GRID_SIZE_METERS
+        east = self.east + (radius + 1) * GRID_SIZE_METERS
+        north = self.north + (radius + 1) * GRID_SIZE_METERS
+        corners = [
+            (west, south),
+            (east, south),
+            (east, north),
+            (west, north),
+            (west, south),
+        ]
+        ring = [[lon, lat] for lon, lat in (TO_WGS84.transform(*p) for p in corners)]
+        return {
+            "type": "Feature",
+            "id": f"{self.grid_id}-r{radius}",
+            "geometry": {"type": "Polygon", "coordinates": [ring]},
+            "properties": {
+                "center_grid_id": self.grid_id,
+                "radius": radius,
+                "cell_count": (radius * 2 + 1) ** 2,
+                "resolution_m": GRID_SIZE_METERS,
+                "crs": GRID_CRS,
+            },
+        }
+
 
 def cell_for_point(longitude: float, latitude: float) -> CensusGridCell:
     east, north = TO_GRID.transform(longitude, latitude)

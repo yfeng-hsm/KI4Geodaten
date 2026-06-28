@@ -53,9 +53,54 @@ def _round_optional(value: Any, digits: int = 2) -> float | None:
     return round(float(value), digits)
 
 
+def _line_feature_from_points(
+    point_features: list[dict[str, Any]],
+    feature_id: str,
+    properties: dict[str, Any],
+) -> dict[str, Any] | None:
+    coordinates = [
+        feature["geometry"]["coordinates"]
+        for feature in sorted(point_features, key=lambda item: item["properties"]["idx"])
+        if feature.get("geometry", {}).get("type") == "Point"
+    ]
+    if len(coordinates) < 2:
+        return None
+    return {
+        "type": "Feature",
+        "id": feature_id,
+        "geometry": {"type": "LineString", "coordinates": coordinates},
+        "properties": properties,
+    }
+
+
+def _line_feature_from_snapped_points(
+    point_features: list[dict[str, Any]],
+    feature_id: str,
+    properties: dict[str, Any],
+) -> dict[str, Any] | None:
+    coordinates = [
+        feature["properties"]["snapped_geometry"]["coordinates"]
+        for feature in sorted(point_features, key=lambda item: item["properties"]["idx"])
+        if feature.get("properties", {}).get("snapped_geometry", {}).get("type") == "Point"
+    ]
+    if len(coordinates) < 2:
+        return None
+    return {
+        "type": "Feature",
+        "id": feature_id,
+        "geometry": {"type": "LineString", "coordinates": coordinates},
+        "properties": properties,
+    }
+
+
 def _increment_count(counter: dict[str, int], value: Any) -> None:
     key = "null" if value is None else str(value)
     counter[key] = counter.get(key, 0) + 1
+
+
+def _increment_weight(counter: dict[str, float], value: Any, weight: float = 1.0) -> None:
+    key = "null" if value is None else str(value)
+    counter[key] = round(counter.get(key, 0.0) + float(weight), 4)
 
 
 def normalize_osm_surface(value: Any) -> str | None:
@@ -72,17 +117,48 @@ def normalize_vlm_surface(value: Any) -> str | None:
     return VLM_SURFACE_GROUPS.get(key)
 
 
-def grouped_surface_counts(counts: dict[str, int]) -> dict[str, int]:
-    grouped: dict[str, int] = {}
+def is_usable_vlm_surface(value: Any) -> bool:
+    return normalize_vlm_surface(value) is not None
+
+
+def surface_candidate_votes(fields: dict[str, Any], surface_key: str) -> dict[str, float]:
+    candidates_key = f"{surface_key}_candidates"
+    raw_candidates = fields.get(candidates_key)
+    votes: dict[str, float] = {}
+    if isinstance(raw_candidates, dict):
+        for material, weight in raw_candidates.items():
+            group = normalize_vlm_surface(material)
+            if group is None:
+                continue
+            try:
+                numeric = float(weight)
+            except (TypeError, ValueError):
+                continue
+            if numeric <= 0:
+                continue
+            votes[group] = votes.get(group, 0.0) + numeric
+    total = sum(votes.values())
+    if total > 0:
+        return {
+            material: round(weight / total, 4)
+            for material, weight in sorted(votes.items())
+        }
+    material = fields.get(surface_key)
+    group = normalize_vlm_surface(material)
+    return {group: 1.0} if group else {}
+
+
+def grouped_surface_counts(counts: dict[str, int | float]) -> dict[str, float]:
+    grouped: dict[str, float] = {}
     for value, count in counts.items():
         group = normalize_vlm_surface(value)
         if group is None:
             continue
-        grouped[group] = grouped.get(group, 0) + int(count)
+        grouped[group] = round(grouped.get(group, 0.0) + float(count), 4)
     return grouped
 
 
-def majority_surface(counts: dict[str, int]) -> str | None:
+def majority_surface(counts: dict[str, int | float]) -> str | None:
     if not counts:
         return None
     return sorted(counts.items(), key=lambda item: (-item[1], item[0]))[0][0]
@@ -324,6 +400,436 @@ class OSMStore:
             },
         }
 
+    def map_match_observations(
+        self,
+        observations: list[dict[str, Any]],
+        *,
+        max_distance_m: float = 12,
+        candidate_limit: int = 4,
+    ) -> dict[str, Any]:
+        if not self.database_url:
+            return self._unavailable_map_matching("DATABASE_URL is not configured")
+        if not observations:
+            return self._available_map_matching([], [], [], [], [], {"count": 0, "matched": 0})
+
+        road_category_sql = self._road_category_sql("r")
+        sql = f"""
+            WITH observations AS (
+                SELECT *
+                FROM jsonb_to_recordset(%s::jsonb) AS obs(
+                    idx integer,
+                    image_id text,
+                    captured_at double precision,
+                    lon double precision,
+                    lat double precision,
+                    heading_deg double precision,
+                    track_heading_deg double precision,
+                    sequence_id text,
+                    capture_position text,
+                    surface_material text,
+                    thumb_256_url text,
+                    thumb_1024_url text,
+                    mapillary_url text,
+                    camera_type text,
+                    width integer,
+                    height integer
+                )
+            ),
+            obs_points AS (
+                SELECT
+                    *,
+                    ST_SetSRID(ST_MakePoint(lon, lat), 4326) AS point_geom,
+                    CASE capture_position
+                        WHEN 'vehicle_road' THEN ARRAY['vehicle']
+                        WHEN 'bicycle_road' THEN ARRAY['bicycle', 'vehicle']
+                        WHEN 'pedestrian_road' THEN ARRAY['pedestrian', 'bicycle', 'vehicle']
+                        ELSE ARRAY['pedestrian', 'bicycle', 'vehicle']
+                    END AS allowed_categories
+                FROM observations
+            ),
+            candidates AS (
+                SELECT
+                    o.*,
+                    c.osm_id,
+                    c.tags,
+                    c.name,
+                    c.highway,
+                    c.maxspeed,
+                    c.oneway,
+                    c.surface,
+                    c.road_category,
+                    c.geom_mainz,
+                    c.distance_m,
+                    c.closest_point,
+                    c.road_bearing_deg,
+                    CASE
+                        WHEN o.capture_position = 'vehicle_road' AND c.road_category = 'vehicle' THEN 0
+                        WHEN o.capture_position = 'bicycle_road' AND c.road_category = 'bicycle' THEN 0
+                        WHEN o.capture_position = 'bicycle_road' AND c.road_category = 'vehicle' THEN 2
+                        WHEN o.capture_position = 'pedestrian_road' AND c.road_category = 'pedestrian' THEN 0
+                        WHEN o.capture_position = 'pedestrian_road' AND c.road_category IN ('bicycle', 'vehicle') THEN 3
+                        ELSE 5
+                    END AS category_penalty,
+                    CASE
+                        WHEN o.track_heading_deg IS NULL OR c.road_bearing_deg IS NULL THEN 0
+                        ELSE LEAST(
+                            LEAST(
+                                ABS(
+                                    MOD(
+                                        (c.road_bearing_deg - o.track_heading_deg + 540.0)::numeric,
+                                        360.0::numeric
+                                    )::double precision - 180.0
+                                ),
+                                180.0
+                            ),
+                            ABS(
+                                180.0 - LEAST(
+                                    ABS(
+                                        MOD(
+                                            (c.road_bearing_deg - o.track_heading_deg + 540.0)::numeric,
+                                            360.0::numeric
+                                        )::double precision - 180.0
+                                    ),
+                                    180.0
+                                )
+                            )
+                        )
+                    END AS track_delta_deg,
+                    CASE
+                        WHEN o.heading_deg IS NULL OR c.road_bearing_deg IS NULL THEN 0
+                        ELSE LEAST(
+                            LEAST(
+                                ABS(
+                                    MOD(
+                                        (c.road_bearing_deg - o.heading_deg + 540.0)::numeric,
+                                        360.0::numeric
+                                    )::double precision - 180.0
+                                ),
+                                180.0
+                            ),
+                            ABS(
+                                180.0 - LEAST(
+                                    ABS(
+                                        MOD(
+                                            (c.road_bearing_deg - o.heading_deg + 540.0)::numeric,
+                                            360.0::numeric
+                                        )::double precision - 180.0
+                                    ),
+                                    180.0
+                                )
+                            )
+                        )
+                    END AS camera_delta_deg
+                FROM obs_points AS o
+                CROSS JOIN LATERAL (
+                    SELECT
+                        r.osm_id,
+                        r.tags,
+                        r.name,
+                        r.highway,
+                        r.maxspeed,
+                        r.oneway,
+                        r.tags->>'surface' AS surface,
+                        {road_category_sql} AS road_category,
+                        r.geom_mainz,
+                        ST_Distance(o.point_geom::geography, r.geom_mainz::geography) AS distance_m,
+                        ST_ClosestPoint(r.geom_mainz, o.point_geom) AS closest_point,
+                        axis.road_bearing_deg
+                    FROM osm_roads AS r
+                    LEFT JOIN LATERAL (
+                        SELECT
+                            degrees(ST_Azimuth(
+                                ST_PointN(dumped.geom, segment_index)::geography,
+                                ST_PointN(dumped.geom, segment_index + 1)::geography
+                            )) AS road_bearing_deg
+                        FROM ST_Dump(r.geom_mainz) AS dumped
+                        CROSS JOIN LATERAL generate_series(1, GREATEST(ST_NPoints(dumped.geom) - 1, 0)) AS segment(segment_index)
+                        WHERE ST_NPoints(dumped.geom) > 1
+                        ORDER BY ST_MakeLine(
+                            ST_PointN(dumped.geom, segment_index),
+                            ST_PointN(dumped.geom, segment_index + 1)
+                        ) <-> o.point_geom
+                        LIMIT 1
+                    ) AS axis ON true
+                    WHERE {road_category_sql} = ANY(o.allowed_categories)
+                        AND r.geom_mainz && ST_Expand(o.point_geom, 0.0002)
+                        AND ST_DWithin(o.point_geom::geography, r.geom_mainz::geography, %s)
+                    ORDER BY r.geom_mainz <-> o.point_geom
+                    LIMIT %s
+                ) AS c
+            ),
+            scored AS (
+                SELECT
+                    *,
+                    (
+                        distance_m
+                        + category_penalty
+                        + COALESCE(track_delta_deg, 0) * 0.035
+                        + COALESCE(camera_delta_deg, 0) * 0.015
+                    ) AS score
+                FROM candidates
+            ),
+            selected AS (
+                SELECT DISTINCT ON (image_id)
+                    *
+                FROM scored
+                ORDER BY image_id, score ASC, distance_m ASC
+            )
+            SELECT
+                *,
+                ST_AsGeoJSON(point_geom, 6) AS point_geometry,
+                ST_AsGeoJSON(closest_point, 6) AS snapped_geometry,
+                ST_AsGeoJSON(ST_MakeLine(point_geom, closest_point), 6) AS link_geometry,
+                ST_AsGeoJSON(geom_mainz, 6) AS road_geometry
+            FROM selected
+            ORDER BY idx ASC
+        """
+        try:
+            with self._connect() as conn:
+                if not self._tables_available(conn):
+                    return self._unavailable_map_matching("OSM tables have not been imported")
+                rows = conn.execute(
+                    sql,
+                    (json.dumps(observations, ensure_ascii=False), max_distance_m, candidate_limit),
+                ).fetchall()
+        except psycopg.Error as exc:
+            return self._unavailable_map_matching(exc.__class__.__name__)
+
+        point_features = []
+        link_features = []
+        road_features_by_id: dict[int, dict[str, Any]] = {}
+        for row in rows:
+            properties = {
+                "image_id": row["image_id"],
+                "idx": row["idx"],
+                "capture_position": row["capture_position"],
+                "surface_material": row["surface_material"],
+                "osm_id": row["osm_id"],
+                "road_category": row["road_category"],
+                "highway": row["highway"],
+                "surface": row["surface"],
+                "distance_m": round(float(row["distance_m"] or 0), 2),
+                "score": round(float(row["score"] or 0), 2),
+                "track_delta_deg": _round_optional(row["track_delta_deg"]),
+                "camera_delta_deg": _round_optional(row["camera_delta_deg"]),
+                "heading_deg": _round_optional(row["heading_deg"]),
+                "track_heading_deg": _round_optional(row["track_heading_deg"]),
+                "sequence_id": row["sequence_id"],
+                "captured_at": row["captured_at"],
+                "thumb_256_url": row["thumb_256_url"],
+                "thumb_1024_url": row["thumb_1024_url"],
+                "mapillary_url": row["mapillary_url"],
+                "camera_type": row["camera_type"],
+                "width": row["width"],
+                "height": row["height"],
+            }
+            point_features.append(
+                {
+                    "type": "Feature",
+                    "id": f"map-match-point/{row['image_id']}",
+                    "geometry": json.loads(row["point_geometry"]),
+                    "properties": {
+                        **properties,
+                        "snapped_geometry": json.loads(row["snapped_geometry"]),
+                    },
+                }
+            )
+            link_features.append(
+                {
+                    "type": "Feature",
+                    "id": f"map-match-link/{row['image_id']}",
+                    "geometry": json.loads(row["link_geometry"]),
+                    "properties": properties,
+                }
+            )
+            road_features_by_id.setdefault(
+                row["osm_id"],
+                {
+                    "type": "Feature",
+                    "id": f"map-match-road/{row['osm_id']}",
+                    "geometry": json.loads(row["road_geometry"]),
+                    "properties": {
+                        "osm_id": row["osm_id"],
+                        "tags": row["tags"],
+                        "name": row["name"],
+                        "highway": row["highway"],
+                        "surface": row["surface"],
+                        "road_category": row["road_category"],
+                    },
+                },
+            )
+
+        raw_trajectory = _line_feature_from_points(
+            point_features,
+            "map-match-raw-trajectory",
+            {"kind": "raw_gps", "count": len(point_features)},
+        )
+        matched_trajectory = _line_feature_from_snapped_points(
+            point_features,
+            "map-match-snapped-trajectory",
+            {"kind": "matched", "count": len(point_features)},
+        )
+
+        return self._available_map_matching(
+            point_features,
+            link_features,
+            list(road_features_by_id.values()),
+            [raw_trajectory] if raw_trajectory else [],
+            [matched_trajectory] if matched_trajectory else [],
+            {
+                "count": len(observations),
+                "matched": len(point_features),
+                "max_distance_m": max_distance_m,
+                "candidate_limit": candidate_limit,
+                "method": "raw_gps_local_sequence_distance_heading_user_type_score",
+            },
+        )
+
+    def nearest_compatible_road_snap(
+        self,
+        *,
+        lon: float,
+        lat: float,
+        capture_position: str | None,
+        max_distance_m: float = 18,
+    ) -> dict[str, Any] | None:
+        if not self.database_url:
+            return None
+        allowed_categories = ["pedestrian", "bicycle", "vehicle"]
+
+        road_category_sql = self._road_category_sql("r")
+        sql = f"""
+            WITH obs AS (
+                SELECT ST_SetSRID(ST_MakePoint(%s, %s), 4326) AS point_geom
+            )
+            SELECT
+                r.osm_id,
+                r.tags,
+                r.name,
+                r.highway,
+                r.maxspeed,
+                r.oneway,
+                r.tags->>'surface' AS surface,
+                {road_category_sql} AS road_category,
+                ST_Distance(obs.point_geom::geography, r.geom_mainz::geography) AS distance_m,
+                ST_AsGeoJSON(ST_ClosestPoint(r.geom_mainz, obs.point_geom), 6) AS snapped_geometry,
+                ST_AsGeoJSON(r.geom_mainz, 6) AS road_geometry
+            FROM osm_roads AS r, obs
+            WHERE {road_category_sql} = ANY(%s::text[])
+                AND r.geom_mainz && ST_Expand(obs.point_geom, 0.0003)
+                AND ST_DWithin(obs.point_geom::geography, r.geom_mainz::geography, %s)
+            ORDER BY
+                (
+                    ST_Distance(obs.point_geom::geography, r.geom_mainz::geography)
+                    + CASE
+                        WHEN %s = 'vehicle_road' AND {road_category_sql} = 'vehicle' THEN 0.0
+                        WHEN %s = 'vehicle_road' AND {road_category_sql} IN ('bicycle', 'pedestrian') THEN 2.5
+                        WHEN %s = 'bicycle_road' AND {road_category_sql} = 'bicycle' THEN 0.0
+                        WHEN %s = 'bicycle_road' AND {road_category_sql} = 'vehicle' THEN 1.5
+                        WHEN %s = 'bicycle_road' AND {road_category_sql} = 'pedestrian' THEN 2.0
+                        WHEN %s = 'pedestrian_road' AND {road_category_sql} = 'pedestrian' THEN 0.0
+                        WHEN %s = 'pedestrian_road' AND {road_category_sql} IN ('bicycle', 'vehicle') THEN 1.5
+                        ELSE 0.0
+                    END
+                ) ASC,
+                ST_Distance(obs.point_geom::geography, r.geom_mainz::geography) ASC
+            LIMIT 1
+        """
+        try:
+            with self._connect() as conn:
+                if not self._tables_available(conn):
+                    return None
+                row = conn.execute(
+                    sql,
+                    (
+                        lon,
+                        lat,
+                        allowed_categories,
+                        max_distance_m,
+                        capture_position,
+                        capture_position,
+                        capture_position,
+                        capture_position,
+                        capture_position,
+                        capture_position,
+                        capture_position,
+                    ),
+                ).fetchone()
+        except psycopg.Error:
+            return None
+        if row is None:
+            return None
+        return {
+            "osm_id": row["osm_id"],
+            "tags": row["tags"],
+            "name": row["name"],
+            "highway": row["highway"],
+            "maxspeed": row["maxspeed"],
+            "oneway": row["oneway"],
+            "surface": row["surface"],
+            "road_category": row["road_category"],
+            "distance_m": round(float(row["distance_m"] or 0), 2),
+            "snapped_geometry": json.loads(row["snapped_geometry"]),
+            "road_geometry": json.loads(row["road_geometry"]),
+        }
+
+    def nearest_road_snap_candidates(
+        self,
+        *,
+        lon: float,
+        lat: float,
+        max_distance_m: float = 30,
+        limit: int = 8,
+    ) -> list[dict[str, Any]]:
+        if not self.database_url:
+            return []
+        road_category_sql = self._road_category_sql("r")
+        sql = f"""
+            WITH obs AS (
+                SELECT ST_SetSRID(ST_MakePoint(%s, %s), 4326) AS point_geom
+            )
+            SELECT
+                r.osm_id,
+                r.tags,
+                r.name,
+                r.highway,
+                r.maxspeed,
+                r.oneway,
+                r.tags->>'surface' AS surface,
+                {road_category_sql} AS road_category,
+                ST_Distance(obs.point_geom::geography, r.geom_mainz::geography) AS distance_m,
+                ST_AsGeoJSON(ST_ClosestPoint(r.geom_mainz, obs.point_geom), 6) AS snapped_geometry,
+                ST_AsGeoJSON(r.geom_mainz, 6) AS road_geometry
+            FROM osm_roads AS r, obs
+            WHERE r.geom_mainz && ST_Expand(obs.point_geom, 0.00035)
+                AND ST_DWithin(obs.point_geom::geography, r.geom_mainz::geography, %s)
+            ORDER BY ST_Distance(obs.point_geom::geography, r.geom_mainz::geography) ASC
+            LIMIT %s
+        """
+        try:
+            with self._connect() as conn:
+                if not self._tables_available(conn):
+                    return []
+                rows = conn.execute(sql, (lon, lat, max_distance_m, limit)).fetchall()
+        except psycopg.Error:
+            return []
+        return [
+            {
+                "osm_id": row["osm_id"],
+                "tags": row["tags"],
+                "name": row["name"],
+                "highway": row["highway"],
+                "maxspeed": row["maxspeed"],
+                "oneway": row["oneway"],
+                "surface": row["surface"],
+                "road_category": row["road_category"],
+                "distance_m": round(float(row["distance_m"] or 0), 2),
+                "snapped_geometry": json.loads(row["snapped_geometry"]),
+                "road_geometry": json.loads(row["road_geometry"]),
+            }
+            for row in rows
+        ]
+
     def cell_road_surface_validation(
         self,
         grid_id: str,
@@ -434,37 +940,37 @@ class OSMStore:
                     n.*,
                     CASE
                         WHEN n.road_category IN ('pedestrian', 'bicycle')
-                            AND n.nearest_same_distance_m <= 35 THEN n.nearest_same_osm_id
+                            AND n.nearest_same_distance_m <= 18 THEN n.nearest_same_osm_id
                         WHEN n.nearest_compatible_distance_m <= 5 THEN n.nearest_compatible_osm_id
-                        WHEN n.nearest_same_distance_m <= 35 THEN n.nearest_same_osm_id
+                        WHEN n.nearest_same_distance_m <= 18 THEN n.nearest_same_osm_id
                         ELSE NULL
                     END AS assigned_osm_id,
                     CASE
                         WHEN n.road_category IN ('pedestrian', 'bicycle')
-                            AND n.nearest_same_distance_m <= 35 THEN n.nearest_same_road_category
+                            AND n.nearest_same_distance_m <= 18 THEN n.nearest_same_road_category
                         WHEN n.nearest_compatible_distance_m <= 5 THEN n.nearest_compatible_road_category
-                        WHEN n.nearest_same_distance_m <= 35 THEN n.nearest_same_road_category
+                        WHEN n.nearest_same_distance_m <= 18 THEN n.nearest_same_road_category
                         ELSE NULL
                     END AS assigned_road_category,
                     CASE
                         WHEN n.road_category IN ('pedestrian', 'bicycle')
-                            AND n.nearest_same_distance_m <= 35 THEN n.nearest_same_distance_m
+                            AND n.nearest_same_distance_m <= 18 THEN n.nearest_same_distance_m
                         WHEN n.nearest_compatible_distance_m <= 5 THEN n.nearest_compatible_distance_m
-                        WHEN n.nearest_same_distance_m <= 35 THEN n.nearest_same_distance_m
+                        WHEN n.nearest_same_distance_m <= 18 THEN n.nearest_same_distance_m
                         ELSE NULL
                     END AS distance_m,
                     CASE
                         WHEN n.road_category IN ('pedestrian', 'bicycle')
-                            AND n.nearest_same_distance_m <= 35 THEN n.nearest_same_closest_point
+                            AND n.nearest_same_distance_m <= 18 THEN n.nearest_same_closest_point
                         WHEN n.nearest_compatible_distance_m <= 5 THEN n.nearest_compatible_closest_point
-                        WHEN n.nearest_same_distance_m <= 35 THEN n.nearest_same_closest_point
+                        WHEN n.nearest_same_distance_m <= 18 THEN n.nearest_same_closest_point
                         ELSE NULL
                     END AS closest_point,
                     CASE
                         WHEN n.road_category IN ('pedestrian', 'bicycle')
-                            AND n.nearest_same_distance_m <= 35 THEN n.nearest_same_geom
+                            AND n.nearest_same_distance_m <= 18 THEN n.nearest_same_geom
                         WHEN n.nearest_compatible_distance_m <= 5 THEN n.nearest_compatible_geom
-                        WHEN n.nearest_same_distance_m <= 35 THEN n.nearest_same_geom
+                        WHEN n.nearest_same_distance_m <= 18 THEN n.nearest_same_geom
                         ELSE NULL
                     END AS assigned_geom
                 FROM nearest AS n
@@ -526,6 +1032,17 @@ class OSMStore:
                             OR (
                                 road_axis.road_bearing_deg IS NOT NULL
                                 AND LEAST(
+                                    ABS(
+                                        MOD(
+                                            (degrees(ST_Azimuth(a.point_geom::geography, a.closest_point::geography))
+                                                - MOD(a.camera_heading_deg::numeric, 360.0::numeric)::double precision
+                                                + 540.0)::numeric,
+                                            360.0::numeric
+                                        )::double precision - 180.0
+                                    ),
+                                    180.0
+                                ) <= 90
+                                AND LEAST(
                                     LEAST(
                                         ABS(
                                             MOD(
@@ -576,73 +1093,180 @@ class OSMStore:
                 SELECT
                     assigned_osm_id AS osm_id,
                     CASE
-                        WHEN road_category = assigned_road_category THEN fields->>'surface_material'
+                        WHEN road_category = assigned_road_category THEN 'surface_material'
                         WHEN fields->>'capture_position' = 'pedestrian_road'
                             AND assigned_road_category = 'vehicle'
                             AND target_side = 'left'
                             AND fields->>'left_adjacent_road_type' = 'vehicle_road'
-                            THEN fields->>'left_adjacent_road_surface_material'
+                            THEN 'left_adjacent_road_surface_material'
                         WHEN fields->>'capture_position' = 'pedestrian_road'
                             AND assigned_road_category = 'vehicle'
                             AND target_side = 'right'
                             AND fields->>'right_adjacent_road_type' = 'vehicle_road'
-                            THEN fields->>'right_adjacent_road_surface_material'
+                            THEN 'right_adjacent_road_surface_material'
                         WHEN fields->>'capture_position' = 'pedestrian_road'
                             AND assigned_road_category = 'bicycle'
                             AND target_side = 'left'
                             AND fields->>'left_adjacent_road_type' = 'bicycle_road'
-                            THEN fields->>'left_adjacent_road_surface_material'
+                            THEN 'left_adjacent_road_surface_material'
                         WHEN fields->>'capture_position' = 'pedestrian_road'
                             AND assigned_road_category = 'bicycle'
                             AND target_side = 'right'
                             AND fields->>'right_adjacent_road_type' = 'bicycle_road'
-                            THEN fields->>'right_adjacent_road_surface_material'
+                            THEN 'right_adjacent_road_surface_material'
                         WHEN fields->>'capture_position' = 'pedestrian_road'
                             AND assigned_road_category = 'vehicle'
                             AND fields->>'left_adjacent_road_type' = 'vehicle_road'
                             AND COALESCE(fields->>'right_adjacent_road_type', '') <> 'vehicle_road'
-                            THEN fields->>'left_adjacent_road_surface_material'
+                            THEN 'left_adjacent_road_surface_material'
                         WHEN fields->>'capture_position' = 'pedestrian_road'
                             AND assigned_road_category = 'vehicle'
                             AND fields->>'right_adjacent_road_type' = 'vehicle_road'
                             AND COALESCE(fields->>'left_adjacent_road_type', '') <> 'vehicle_road'
-                            THEN fields->>'right_adjacent_road_surface_material'
+                            THEN 'right_adjacent_road_surface_material'
                         WHEN fields->>'capture_position' = 'pedestrian_road'
                             AND assigned_road_category = 'bicycle'
                             AND fields->>'left_adjacent_road_type' = 'bicycle_road'
                             AND COALESCE(fields->>'right_adjacent_road_type', '') <> 'bicycle_road'
-                            THEN fields->>'left_adjacent_road_surface_material'
+                            THEN 'left_adjacent_road_surface_material'
                         WHEN fields->>'capture_position' = 'pedestrian_road'
                             AND assigned_road_category = 'bicycle'
                             AND fields->>'right_adjacent_road_type' = 'bicycle_road'
                             AND COALESCE(fields->>'left_adjacent_road_type', '') <> 'bicycle_road'
-                            THEN fields->>'right_adjacent_road_surface_material'
+                            THEN 'right_adjacent_road_surface_material'
                         ELSE NULL
-                    END AS surface_material
+                    END AS surface_key,
+                    fields
                 FROM visible
                 WHERE assigned_osm_id IS NOT NULL
                     AND within_view_cone
             ),
+            sidewalk_surface_observations AS (
+                SELECT
+                    nearest_ped.osm_id,
+                    c.fields->>'left_sidewalk_surface_material' AS surface_material,
+                    c.fields->'left_sidewalk_surface_material_candidates' AS surface_candidates
+                FROM candidates AS c
+                CROSS JOIN LATERAL (
+                    SELECT ST_SetSRID(
+                        ST_Project(
+                            c.point_geom::geography,
+                            2.0,
+                            radians(MOD((c.camera_heading_deg - 90.0 + 360.0)::numeric, 360.0)::double precision)
+                        )::geometry,
+                        4326
+                    ) AS point_geom
+                ) AS virtual_point
+                JOIN LATERAL (
+                    SELECT sr.osm_id
+                    FROM selected_roads AS sr
+                    WHERE sr.road_category = 'pedestrian'
+                        AND ST_DWithin(
+                            virtual_point.point_geom::geography,
+                            sr.geometry::geography,
+                            8
+                        )
+                    ORDER BY sr.geometry <-> virtual_point.point_geom
+                    LIMIT 1
+                ) AS nearest_ped ON true
+                WHERE c.road_category = 'vehicle'
+                    AND c.camera_heading_deg IS NOT NULL
+                    AND c.fields->>'left_sidewalk' = 'yes'
+                UNION ALL
+                SELECT
+                    nearest_ped.osm_id,
+                    c.fields->>'right_sidewalk_surface_material' AS surface_material,
+                    c.fields->'right_sidewalk_surface_material_candidates' AS surface_candidates
+                FROM candidates AS c
+                CROSS JOIN LATERAL (
+                    SELECT ST_SetSRID(
+                        ST_Project(
+                            c.point_geom::geography,
+                            2.0,
+                            radians(MOD((c.camera_heading_deg + 90.0 + 360.0)::numeric, 360.0)::double precision)
+                        )::geometry,
+                        4326
+                    ) AS point_geom
+                ) AS virtual_point
+                JOIN LATERAL (
+                    SELECT sr.osm_id
+                    FROM selected_roads AS sr
+                    WHERE sr.road_category = 'pedestrian'
+                        AND ST_DWithin(
+                            virtual_point.point_geom::geography,
+                            sr.geometry::geography,
+                            8
+                        )
+                    ORDER BY sr.geometry <-> virtual_point.point_geom
+                    LIMIT 1
+                ) AS nearest_ped ON true
+                WHERE c.road_category = 'vehicle'
+                    AND c.camera_heading_deg IS NOT NULL
+                    AND c.fields->>'right_sidewalk' = 'yes'
+            ),
             surface_count_rows AS (
                 SELECT
-                    osm_id,
-                    surface_material,
-                    count(*)::integer AS count
-                FROM surface_observations
-                WHERE surface_material IN (
-                        'asphalt',
-                        'concrete',
-                        'paving_stones',
-                        'sett',
-                        'unpaved'
-                    )
-                GROUP BY osm_id, surface_material
+                    observation.osm_id,
+                    vote.surface_material,
+                    sum(vote.weight)::double precision AS count
+                FROM (
+                    SELECT
+                        osm_id,
+                        fields->>surface_key AS surface_material,
+                        fields->(surface_key || '_candidates') AS surface_candidates
+                    FROM surface_observations
+                    WHERE surface_key IS NOT NULL
+                    UNION ALL
+                    SELECT * FROM sidewalk_surface_observations
+                ) AS observation
+                CROSS JOIN LATERAL (
+                    SELECT
+                        valid_candidate.surface_material,
+                        valid_candidate.value::double precision AS weight
+                    FROM (
+                        SELECT
+                            candidate.key AS surface_material,
+                            candidate.value
+                        FROM jsonb_each_text(
+                            CASE
+                                WHEN jsonb_typeof(observation.surface_candidates) = 'object'
+                                    AND observation.surface_candidates <> '{{}}'::jsonb
+                                    THEN observation.surface_candidates
+                                ELSE '{{}}'::jsonb
+                            END
+                        ) AS candidate(key, value)
+                        WHERE candidate.key IN (
+                                'asphalt',
+                                'concrete',
+                                'paving_stones',
+                                'sett',
+                                'unpaved'
+                            )
+                            AND candidate.value ~ '^[0-9]+(\\.[0-9]+)?$'
+                    ) AS valid_candidate
+                    WHERE valid_candidate.value::double precision > 0
+                    UNION ALL
+                    SELECT observation.surface_material, 1.0
+                    WHERE (
+                            observation.surface_candidates IS NULL
+                            OR jsonb_typeof(observation.surface_candidates) <> 'object'
+                            OR observation.surface_candidates = '{{}}'::jsonb
+                        )
+                        AND observation.surface_material IN (
+                            'asphalt',
+                            'concrete',
+                            'paving_stones',
+                            'sett',
+                            'unpaved'
+                        )
+                ) AS vote
+                GROUP BY observation.osm_id, vote.surface_material
             ),
             surface_counts AS (
                 SELECT
                     osm_id,
                     jsonb_object_agg(surface_material, count) AS surface_counts,
-                    sum(count)::integer AS usable_surface_count
+                    sum(count)::double precision AS usable_surface_count
                 FROM surface_count_rows
                 GROUP BY osm_id
             )
@@ -721,7 +1345,7 @@ class OSMStore:
                         "vlm_surface_group": vlm_surface_group,
                         "vlm_surface_counts": row_surface_counts,
                         "vlm_surface_group_counts": surface_counts,
-                        "vlm_match_count": int(row_usable_surface_count or 0),
+                        "vlm_match_count": round(float(row_usable_surface_count or 0), 2),
                         "vlm_usable_surface_count": usable_surface_count,
                     },
                 }
@@ -757,11 +1381,11 @@ class OSMStore:
         self,
         osm_id: int,
         *,
-        max_distance_m: float = 35,
-        close_override_m: float = 5,
+        max_distance_m: float = 8,
+        close_override_m: float = 4,
         view_fov_deg: float = 110,
         on_road_visible_m: float = 1,
-        no_heading_visible_m: float = 5,
+        no_heading_visible_m: float = 3,
         road_axis_tolerance_deg: float = 35,
         limit: int = 200,
     ) -> dict[str, Any] | None:
@@ -981,6 +1605,17 @@ class OSMStore:
                             OR (
                                 road_axis.road_bearing_deg IS NOT NULL
                                 AND LEAST(
+                                    ABS(
+                                        MOD(
+                                            (degrees(ST_Azimuth(a.point_geom::geography, a.closest_point::geography))
+                                                - MOD(a.camera_heading_deg::numeric, 360.0::numeric)::double precision
+                                                + 540.0)::numeric,
+                                            360.0::numeric
+                                        )::double precision - 180.0
+                                    ),
+                                    180.0
+                                ) <= 90
+                                AND LEAST(
                                     LEAST(
                                         ABS(
                                             MOD(
@@ -1056,191 +1691,6 @@ class OSMStore:
                 ST_AsGeoJSON(r.geom_mainz, 6) AS geometry
             FROM osm_roads AS r
             WHERE r.osm_id = %s
-        """
-        adjacent_sidewalk_sql = f"""
-            WITH selected AS (
-                SELECT
-                    r.osm_id,
-                    r.tags,
-                    r.name,
-                    r.highway,
-                    r.maxspeed,
-                    r.oneway,
-                    r.geom_mainz,
-                    {road_category_sql} AS road_category
-                FROM osm_roads AS r
-                WHERE r.osm_id = %s
-            ),
-            candidates AS (
-                SELECT
-                    v.image_id,
-                    v.grid_id,
-                    v.model,
-                    v.prompt_version,
-                    v.geometry,
-                    v.image_properties,
-                    v.fields,
-                    v.error,
-                    v.updated_at,
-                    ST_SetSRID(ST_GeomFromGeoJSON(v.geometry::text), 4326) AS point_geom,
-                    COALESCE(
-                        NULLIF(v.image_properties->>'computed_compass_angle', '')::double precision,
-                        NULLIF(v.image_properties->>'compass_angle', '')::double precision
-                    ) AS camera_heading_deg,
-                    'vehicle' AS road_category
-                FROM vlm_image_analysis AS v
-                WHERE v.geometry IS NOT NULL
-                    AND COALESCE(v.fields->>'unusable_reason', 'none') = 'none'
-                    AND v.fields->>'capture_position' = 'vehicle_road'
-                    AND (
-                        v.fields->>'left_sidewalk' = 'yes'
-                        OR v.fields->>'right_sidewalk' = 'yes'
-                    )
-            ),
-            visible AS (
-                SELECT
-                    c.*,
-                    s.osm_id AS selected_osm_id,
-                    s.name AS selected_name,
-                    s.highway AS selected_highway,
-                    s.road_category AS selected_road_category,
-                    s.geom_mainz AS selected_geom,
-                    s.osm_id AS assigned_osm_id,
-                    s.road_category AS assigned_road_category,
-                    ST_Distance(c.point_geom::geography, s.geom_mainz::geography) AS distance_m,
-                    ST_ClosestPoint(s.geom_mainz, c.point_geom) AS closest_point,
-                    s.geom_mainz AS assigned_geom,
-                    'adjacent_sidewalk_from_vehicle' AS match_method,
-                    road_axis.road_bearing_deg,
-                    CASE
-                        WHEN ST_Distance(c.point_geom::geography, s.geom_mainz::geography) <= %s THEN 0.0
-                        WHEN c.camera_heading_deg IS NULL THEN NULL
-                        ELSE degrees(ST_Azimuth(c.point_geom::geography, ST_ClosestPoint(s.geom_mainz, c.point_geom)::geography))
-                    END AS target_bearing_deg,
-                    CASE
-                        WHEN ST_Distance(c.point_geom::geography, s.geom_mainz::geography) <= %s THEN 0.0
-                        WHEN c.camera_heading_deg IS NULL THEN NULL
-                        ELSE LEAST(
-                            ABS(
-                                MOD(
-                                    (degrees(ST_Azimuth(c.point_geom::geography, ST_ClosestPoint(s.geom_mainz, c.point_geom)::geography))
-                                        - MOD(c.camera_heading_deg::numeric, 360.0::numeric)::double precision
-                                        + 540.0)::numeric,
-                                    360.0::numeric
-                                )::double precision - 180.0
-                            ),
-                            180.0
-                        )
-                    END AS view_delta_deg,
-                    CASE
-                        WHEN ST_Distance(c.point_geom::geography, s.geom_mainz::geography) <= %s THEN 0.0
-                        WHEN c.camera_heading_deg IS NULL OR road_axis.road_bearing_deg IS NULL THEN NULL
-                        ELSE LEAST(
-                            LEAST(
-                                ABS(
-                                    MOD(
-                                        (road_axis.road_bearing_deg
-                                            - MOD(c.camera_heading_deg::numeric, 360.0::numeric)::double precision
-                                            + 540.0)::numeric,
-                                        360.0::numeric
-                                    )::double precision - 180.0
-                                ),
-                                180.0
-                            ),
-                            ABS(
-                                180.0 - LEAST(
-                                    ABS(
-                                        MOD(
-                                            (road_axis.road_bearing_deg
-                                                - MOD(c.camera_heading_deg::numeric, 360.0::numeric)::double precision
-                                                + 540.0)::numeric,
-                                            360.0::numeric
-                                        )::double precision - 180.0
-                                    ),
-                                    180.0
-                                )
-                            )
-                        )
-                    END AS road_axis_delta_deg,
-                    CASE
-                        WHEN ST_Distance(c.point_geom::geography, s.geom_mainz::geography) <= %s THEN true
-                        WHEN c.camera_heading_deg IS NULL THEN ST_Distance(c.point_geom::geography, s.geom_mainz::geography) <= %s
-                        ELSE (
-                            LEAST(
-                                ABS(
-                                    MOD(
-                                        (degrees(ST_Azimuth(c.point_geom::geography, ST_ClosestPoint(s.geom_mainz, c.point_geom)::geography))
-                                            - MOD(c.camera_heading_deg::numeric, 360.0::numeric)::double precision
-                                            + 540.0)::numeric,
-                                        360.0::numeric
-                                    )::double precision - 180.0
-                                ),
-                                180.0
-                            ) <= %s
-                            OR (
-                                road_axis.road_bearing_deg IS NOT NULL
-                                AND LEAST(
-                                    LEAST(
-                                        ABS(
-                                            MOD(
-                                                (road_axis.road_bearing_deg
-                                                    - MOD(c.camera_heading_deg::numeric, 360.0::numeric)::double precision
-                                                    + 540.0)::numeric,
-                                                360.0::numeric
-                                            )::double precision - 180.0
-                                        ),
-                                        180.0
-                                    ),
-                                    ABS(
-                                        180.0 - LEAST(
-                                            ABS(
-                                                MOD(
-                                                    (road_axis.road_bearing_deg
-                                                        - MOD(c.camera_heading_deg::numeric, 360.0::numeric)::double precision
-                                                        + 540.0)::numeric,
-                                                    360.0::numeric
-                                                )::double precision - 180.0
-                                            ),
-                                            180.0
-                                        )
-                                    )
-                                ) <= %s
-                            )
-                        )
-                    END AS within_view_cone,
-                    ST_AsGeoJSON(c.point_geom, 6) AS point_geometry,
-                    ST_AsGeoJSON(ST_MakeLine(c.point_geom, ST_ClosestPoint(s.geom_mainz, c.point_geom)), 6) AS link_geometry
-                FROM candidates AS c
-                CROSS JOIN selected AS s
-                LEFT JOIN LATERAL (
-                    SELECT
-                        degrees(ST_Azimuth(
-                            ST_PointN(dumped.geom, segment_index)::geography,
-                            ST_PointN(dumped.geom, segment_index + 1)::geography
-                        )) AS road_bearing_deg
-                    FROM ST_Dump(s.geom_mainz) AS dumped
-                    CROSS JOIN LATERAL generate_series(1, GREATEST(ST_NPoints(dumped.geom) - 1, 0)) AS segment(segment_index)
-                    WHERE ST_NPoints(dumped.geom) > 1
-                    ORDER BY ST_MakeLine(
-                        ST_PointN(dumped.geom, segment_index),
-                        ST_PointN(dumped.geom, segment_index + 1)
-                    ) <-> c.point_geom
-                    LIMIT 1
-                ) AS road_axis ON true
-                WHERE s.road_category = 'pedestrian'
-                    AND ST_DWithin(c.point_geom::geography, s.geom_mainz::geography, %s)
-                    AND s.osm_id = (
-                        SELECT nearest_ped.osm_id
-                        FROM osm_roads AS nearest_ped
-                        WHERE {nearest_pedestrian_category_sql} = 'pedestrian'
-                        ORDER BY nearest_ped.geom_mainz <-> c.point_geom
-                        LIMIT 1
-                    )
-            )
-            SELECT *
-            FROM visible
-            ORDER BY distance_m ASC
-            LIMIT %s
         """
         side_observation_sql = f"""
             WITH selected AS (
@@ -1354,6 +1804,7 @@ class OSMStore:
                     camera_heading_deg,
                     CASE fields->>'left_adjacent_road_type'
                         WHEN 'vehicle_road' THEN 'vehicle'
+                        WHEN 'pedestrian_road' THEN 'pedestrian'
                         WHEN 'bicycle_road' THEN 'bicycle'
                         ELSE NULL
                     END AS road_category,
@@ -1361,8 +1812,8 @@ class OSMStore:
                     'left_adjacent_road_virtual' AS observation_source,
                     'left' AS observation_side
                 FROM source_images
-                WHERE fields->>'capture_position' = 'pedestrian_road'
-                    AND fields->>'left_adjacent_road_type' IN ('vehicle_road', 'bicycle_road')
+                WHERE fields->>'capture_position' IN ('pedestrian_road', 'bicycle_road')
+                    AND fields->>'left_adjacent_road_type' IN ('vehicle_road', 'pedestrian_road', 'bicycle_road')
                     AND camera_heading_deg IS NOT NULL
                 UNION ALL
                 SELECT
@@ -1386,6 +1837,7 @@ class OSMStore:
                     camera_heading_deg,
                     CASE fields->>'right_adjacent_road_type'
                         WHEN 'vehicle_road' THEN 'vehicle'
+                        WHEN 'pedestrian_road' THEN 'pedestrian'
                         WHEN 'bicycle_road' THEN 'bicycle'
                         ELSE NULL
                     END AS road_category,
@@ -1393,8 +1845,8 @@ class OSMStore:
                     'right_adjacent_road_virtual' AS observation_source,
                     'right' AS observation_side
                 FROM source_images
-                WHERE fields->>'capture_position' = 'pedestrian_road'
-                    AND fields->>'right_adjacent_road_type' IN ('vehicle_road', 'bicycle_road')
+                WHERE fields->>'capture_position' IN ('pedestrian_road', 'bicycle_road')
+                    AND fields->>'right_adjacent_road_type' IN ('vehicle_road', 'pedestrian_road', 'bicycle_road')
                     AND camera_heading_deg IS NOT NULL
             )
             SELECT
@@ -1438,100 +1890,13 @@ class OSMStore:
             CROSS JOIN selected AS s
             WHERE o.road_category = s.road_category
                 AND o.observation_surface_material IS NOT NULL
-                AND ST_DWithin(o.point_geom::geography, s.geom_mainz::geography, %s)
+                AND o.observation_surface_material <> 'uncertain'
+                AND ST_DWithin(o.point_geom::geography, s.geom_mainz::geography, LEAST(%s::double precision, 5.0))
                 AND s.osm_id = (
                     SELECT nearest_side.osm_id
                     FROM osm_roads AS nearest_side
                     WHERE {nearest_side_category_sql} = o.road_category
                     ORDER BY nearest_side.geom_mainz <-> o.point_geom
-                    LIMIT 1
-                )
-            ORDER BY distance_m ASC
-            LIMIT %s
-        """
-        adjacent_sidewalk_sql = f"""
-            WITH selected AS (
-                SELECT
-                    r.osm_id,
-                    r.tags,
-                    r.name,
-                    r.highway,
-                    r.maxspeed,
-                    r.oneway,
-                    r.geom_mainz,
-                    {road_category_sql} AS road_category
-                FROM osm_roads AS r
-                WHERE r.osm_id = %s
-            )
-            SELECT
-                v.image_id,
-                v.grid_id,
-                v.model,
-                v.prompt_version,
-                v.geometry,
-                v.image_properties,
-                v.fields,
-                v.error,
-                v.updated_at,
-                ST_SetSRID(ST_GeomFromGeoJSON(v.geometry::text), 4326) AS point_geom,
-                COALESCE(
-                    NULLIF(v.image_properties->>'computed_compass_angle', '')::double precision,
-                    NULLIF(v.image_properties->>'compass_angle', '')::double precision
-                ) AS camera_heading_deg,
-                'vehicle' AS road_category,
-                s.osm_id AS selected_osm_id,
-                s.name AS selected_name,
-                s.highway AS selected_highway,
-                s.road_category AS selected_road_category,
-                s.geom_mainz AS selected_geom,
-                s.osm_id AS assigned_osm_id,
-                s.road_category AS assigned_road_category,
-                ST_Distance(ST_SetSRID(ST_GeomFromGeoJSON(v.geometry::text), 4326)::geography, s.geom_mainz::geography) AS distance_m,
-                ST_ClosestPoint(s.geom_mainz, ST_SetSRID(ST_GeomFromGeoJSON(v.geometry::text), 4326)) AS closest_point,
-                s.geom_mainz AS assigned_geom,
-                'adjacent_sidewalk_from_vehicle' AS match_method,
-                CASE
-                    WHEN COALESCE(
-                        NULLIF(v.image_properties->>'computed_compass_angle', '')::double precision,
-                        NULLIF(v.image_properties->>'compass_angle', '')::double precision
-                    ) IS NULL THEN NULL
-                    ELSE degrees(ST_Azimuth(
-                        ST_SetSRID(ST_GeomFromGeoJSON(v.geometry::text), 4326)::geography,
-                        ST_ClosestPoint(s.geom_mainz, ST_SetSRID(ST_GeomFromGeoJSON(v.geometry::text), 4326))::geography
-                    ))
-                END AS target_bearing_deg,
-                NULL::double precision AS view_delta_deg,
-                NULL::double precision AS road_bearing_deg,
-                NULL::double precision AS road_axis_delta_deg,
-                true AS within_view_cone,
-                ST_AsGeoJSON(ST_SetSRID(ST_GeomFromGeoJSON(v.geometry::text), 4326), 6) AS point_geometry,
-                ST_AsGeoJSON(
-                    ST_MakeLine(
-                        ST_SetSRID(ST_GeomFromGeoJSON(v.geometry::text), 4326),
-                        ST_ClosestPoint(s.geom_mainz, ST_SetSRID(ST_GeomFromGeoJSON(v.geometry::text), 4326))
-                    ),
-                    6
-                ) AS link_geometry
-            FROM selected AS s
-            JOIN vlm_image_analysis AS v ON true
-            WHERE s.road_category = 'pedestrian'
-                AND v.geometry IS NOT NULL
-                AND COALESCE(v.fields->>'unusable_reason', 'none') = 'none'
-                AND v.fields->>'capture_position' = 'vehicle_road'
-                AND (
-                    v.fields->>'left_sidewalk' = 'yes'
-                    OR v.fields->>'right_sidewalk' = 'yes'
-                )
-                AND ST_DWithin(
-                    ST_SetSRID(ST_GeomFromGeoJSON(v.geometry::text), 4326)::geography,
-                    s.geom_mainz::geography,
-                    %s
-                )
-                AND s.osm_id = (
-                    SELECT nearest_ped.osm_id
-                    FROM osm_roads AS nearest_ped
-                    WHERE {nearest_pedestrian_category_sql} = 'pedestrian'
-                    ORDER BY nearest_ped.geom_mainz <-> ST_SetSRID(ST_GeomFromGeoJSON(v.geometry::text), 4326)
                     LIMIT 1
                 )
             ORDER BY distance_m ASC
@@ -1580,7 +1945,7 @@ class OSMStore:
                     side_observation_sql,
                     (
                         osm_id,
-                        max(max_distance_m, 60),
+                        max_distance_m,
                         limit,
                     ),
                 ).fetchall()
@@ -1624,8 +1989,26 @@ class OSMStore:
             if row.get("observation_surface_material") is not None:
                 matched_surface = row["observation_surface_material"]
                 matched_surface_source = row.get("observation_source") or matched_surface_source
+            if not is_usable_vlm_surface(matched_surface):
+                continue
             if row["match_method"] == "adjacent_sidewalk_from_vehicle" and matched_surface is None:
                 continue
+            surface_key = {
+                "capture_position": "surface_material",
+                "left_sidewalk_virtual": "left_sidewalk_surface_material",
+                "right_sidewalk_virtual": "right_sidewalk_surface_material",
+                "left_adjacent_road_virtual": "left_adjacent_road_surface_material",
+                "right_adjacent_road_virtual": "right_adjacent_road_surface_material",
+                "left_sidewalk_from_vehicle": "left_sidewalk_surface_material",
+                "right_sidewalk_from_vehicle": "right_sidewalk_surface_material",
+                "left_sidewalk_from_vehicle_nearest": "left_sidewalk_surface_material",
+                "right_sidewalk_from_vehicle_nearest": "right_sidewalk_surface_material",
+                "left_adjacent_road": "left_adjacent_road_surface_material",
+                "right_adjacent_road": "right_adjacent_road_surface_material",
+            }.get(matched_surface_source, "surface_material")
+            matched_surface_votes = surface_candidate_votes(fields, surface_key)
+            if not matched_surface_votes:
+                matched_surface_votes = {matched_surface: 1.0}
             point_feature_geometry = json.loads(point_geometry)
             link_feature_geometry = json.loads(link_geometry)
             virtual_side = row.get("observation_side") or virtual_observation_side(matched_surface_source)
@@ -1641,7 +2024,8 @@ class OSMStore:
                 is_virtual_observation = True
             _increment_count(stats["capture_position"], fields.get("capture_position"))
             _increment_count(stats["surface_material"], fields.get("surface_material"))
-            _increment_count(stats["matched_road_surface_material"], matched_surface)
+            for vote_surface, vote_weight in matched_surface_votes.items():
+                _increment_weight(stats["matched_road_surface_material"], vote_surface, vote_weight)
             _increment_count(stats["matched_road_surface_source"], matched_surface_source)
             _increment_count(stats["left_adjacent_road_type"], fields.get("left_adjacent_road_type"))
             _increment_count(stats["left_adjacent_road_surface_material"], fields.get("left_adjacent_road_surface_material"))
@@ -1664,10 +2048,11 @@ class OSMStore:
                 "capture_position": fields.get("capture_position"),
                 "surface_material": fields.get("surface_material"),
                 "matched_road_surface_material": matched_surface,
+                "matched_road_surface_votes": matched_surface_votes,
                 "matched_road_surface_source": matched_surface_source,
                 "virtual_observation": is_virtual_observation,
                 "virtual_observation_side": virtual_side,
-                "observation_vote": 1,
+                "observation_vote": round(sum(matched_surface_votes.values()), 4),
                 "target_side": target_side,
                 "left_adjacent_road_type": fields.get("left_adjacent_road_type"),
                 "left_adjacent_road_surface_material": fields.get("left_adjacent_road_surface_material"),
@@ -1754,6 +2139,12 @@ class OSMStore:
     def _road_category_sql(self, alias: str) -> str:
         return f"""
             CASE
+                WHEN {alias}.highway IN ('platform', 'corridor', 'elevator')
+                    THEN 'pedestrian'
+                WHEN {alias}.tags->>'psv' IN ('yes', 'designated')
+                    OR {alias}.tags->>'bus' IN ('yes', 'designated')
+                    OR {alias}.tags ? 'busway'
+                    THEN 'vehicle'
                 WHEN {alias}.highway = 'cycleway'
                     OR {alias}.tags->>'bicycle' = 'designated'
                     THEN 'bicycle'
@@ -1854,4 +2245,40 @@ class OSMStore:
                 "mismatch": 0,
                 "skipped": {},
             },
+        }
+
+    def _unavailable_map_matching(self, reason: str) -> dict[str, Any]:
+        empty = {"type": "FeatureCollection", "features": []}
+        return {
+            "available": False,
+            "reason": reason,
+            "layers": {
+                "points": empty,
+                "links": empty,
+                "matched_roads": empty,
+                "raw_trajectory": empty,
+                "matched_trajectory": empty,
+            },
+            "meta": {"count": 0, "matched": 0},
+        }
+
+    def _available_map_matching(
+        self,
+        points: list[dict[str, Any]],
+        links: list[dict[str, Any]],
+        matched_roads: list[dict[str, Any]],
+        raw_trajectory: list[dict[str, Any]],
+        matched_trajectory: list[dict[str, Any]],
+        meta: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "available": True,
+            "layers": {
+                "points": {"type": "FeatureCollection", "features": points},
+                "links": {"type": "FeatureCollection", "features": links},
+                "matched_roads": {"type": "FeatureCollection", "features": matched_roads},
+                "raw_trajectory": {"type": "FeatureCollection", "features": raw_trajectory},
+                "matched_trajectory": {"type": "FeatureCollection", "features": matched_trajectory},
+            },
+            "meta": meta,
         }

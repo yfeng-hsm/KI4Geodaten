@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import httpx
@@ -89,3 +90,63 @@ def test_normalize_preserves_original_and_computed_geometry():
     assert feature["properties"]["geometry_source"] == "original"
     assert feature["properties"]["sequence_id"] == "sequence-1"
     assert feature["properties"]["mapillary_url"].endswith("pKey=123")
+
+
+def test_normalize_accepts_string_sequence_id():
+    feature = _normalize_image(
+        {
+            "id": "123",
+            "geometry": {"type": "Point", "coordinates": [1, 2]},
+            "sequence": "sequence-1",
+        }
+    )
+
+    assert feature["properties"]["sequence_id"] == "sequence-1"
+    assert "sequence" not in feature["properties"]
+
+
+def test_cached_images_for_sequence_merges_cached_cells(tmp_path):
+    cache_a = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "id": "later",
+                "geometry": {"type": "Point", "coordinates": [1, 1]},
+                "properties": {"sequence_id": "seq-1", "captured_at": 20},
+            },
+            {
+                "type": "Feature",
+                "id": "other",
+                "geometry": {"type": "Point", "coordinates": [2, 2]},
+                "properties": {"sequence_id": "seq-2", "captured_at": 10},
+            },
+        ],
+        "meta": {"grid_id": "cell-a", "mapillary_cache_schema_version": 4},
+    }
+    cache_b = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "id": "earlier",
+                "geometry": {"type": "Point", "coordinates": [0, 0]},
+                "properties": {"sequence_id": "seq-1", "captured_at": 5},
+            },
+            {
+                "type": "Feature",
+                "id": "later",
+                "geometry": {"type": "Point", "coordinates": [1, 1]},
+                "properties": {"sequence_id": "seq-1", "captured_at": 20},
+            },
+        ],
+        "meta": {"grid_id": "cell-b", "mapillary_cache_schema_version": 4},
+    }
+    (tmp_path / "cell-a.geojson").write_text(json.dumps(cache_a), encoding="utf-8")
+    (tmp_path / "cell-b.geojson").write_text(json.dumps(cache_b), encoding="utf-8")
+
+    result = MapillaryClient(settings(tmp_path)).cached_images_for_sequence("seq-1")
+
+    assert [feature["id"] for feature in result["features"]] == ["earlier", "later"]
+    assert result["meta"]["count"] == 2
+    assert result["meta"]["grid_count"] == 2

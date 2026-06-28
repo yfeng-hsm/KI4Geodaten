@@ -18,12 +18,15 @@ class Settings:
     ollama_max_images_per_request: int
     ollama_image_thumb_size: int
     ollama_concurrency: int = 4
+    graphhopper_base_url: str | None = None
+    graphhopper_timeout_seconds: int = 30
 
     @classmethod
     def from_env(cls) -> "Settings":
         token = os.getenv("MAPILLARY_ACCESS_TOKEN", "").strip() or None
         database_url = os.getenv("DATABASE_URL", "").strip() or None
         ollama_base_url = os.getenv("OLLAMA_BASE_URL", "").strip().rstrip("/") or None
+        graphhopper_base_url = os.getenv("GRAPHHOPPER_BASE_URL", "").strip().rstrip("/") or None
         return cls(
             mapillary_access_token=token,
             cache_dir=Path(os.getenv("MAPILLARY_CACHE_DIR", "data/cache")),
@@ -43,6 +46,8 @@ class Settings:
             ),
             ollama_image_thumb_size=_ollama_image_thumb_size(),
             ollama_concurrency=max(1, int(os.getenv("OLLAMA_CONCURRENCY", "4"))),
+            graphhopper_base_url=graphhopper_base_url,
+            graphhopper_timeout_seconds=int(os.getenv("GRAPHHOPPER_TIMEOUT_SECONDS", "30")),
         )
 
 

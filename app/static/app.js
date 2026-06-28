@@ -46,20 +46,28 @@ const buildingRenderer = L.canvas({ pane: "buildingPane", padding: 0.4 });
 const pedestrianRoadRenderer = L.canvas({ pane: "pedestrianRoadPane", padding: 0.4, tolerance: 8 });
 const vehicleRoadRenderer = L.canvas({ pane: "vehicleRoadPane", padding: 0.4, tolerance: 8 });
 const bicycleRoadRenderer = L.canvas({ pane: "bicycleRoadPane", padding: 0.4, tolerance: 8 });
-const vlmResultRenderer = L.svg({ pane: "vlmResultPane", padding: 0.4 });
+const vlmResultRenderer = L.canvas({ pane: "vlmResultPane", padding: 0.4 });
 const roadMatchRenderer = L.svg({ pane: "roadMatchPane", padding: 0.4 });
 let selectedGridLayer = null;
+let selectedGridNeighborhoodLayer = null;
 let selectedRoadFeature = null;
 let currentRoadFeatures = [];
 let currentGrid = null;
 let currentImageFeature = null;
 let currentImageFeatures = [];
+let currentMapMatchingLayers = null;
+let currentMapMatchingSegmentSummaries = [];
+let currentMapMatchingSelectedSegment = null;
+let currentMapMatchingPointFeatures = [];
+let currentConfirmedMapMatchingPointFeatures = [];
+let allConfirmedMapMatchedPointFeatures = [];
 let vlmResultsByImageId = {};
 let allVlmResultsByImageId = {};
 let currentCellProcessPlan = emptyProcessPlan();
 let mapillaryGeometryMode = "original";
 let requestSequence = 0;
 let cellMapSequence = 0;
+let mapMatchingSequence = 0;
 let vlmResultsSequence = 0;
 let allVlmResultsSequence = 0;
 let vlmRenderFrame = null;
@@ -69,19 +77,25 @@ let ollamaReady = false;
 let selectedModel = "";
 let selectedVlmTheme = "capture_position";
 let surfaceValidationRunning = false;
+let mapMatchingRunning = false;
 
 const VLM_DISPLAY_FIELDS = [
   "unusable_reason",
   "capture_position",
   "surface_material",
+  "surface_material_candidates",
   "left_sidewalk",
   "left_sidewalk_surface_material",
+  "left_sidewalk_surface_material_candidates",
   "right_sidewalk",
   "right_sidewalk_surface_material",
+  "right_sidewalk_surface_material_candidates",
   "left_adjacent_road_type",
   "left_adjacent_road_surface_material",
+  "left_adjacent_road_surface_material_candidates",
   "right_adjacent_road_type",
   "right_adjacent_road_surface_material",
+  "right_adjacent_road_surface_material_candidates",
   "traffic_signal",
   "bench",
   "waste_basket",
@@ -112,6 +126,10 @@ const VLM_THEME_FIELDS = [
 
 const CELL_PROCESS_DISTANCE_METERS = 5;
 const VLM_RENDER_BOUNDS_PADDING = 0.18;
+const VLM_RENDER_FEATURE_LIMIT = 1200;
+const VLM_RENDER_VIRTUAL_MIN_ZOOM = 17;
+const SELECTED_GRID_NEIGHBORHOOD_RADIUS = 1;
+const OSM_LAYER_RADIUS = 0;
 
 function censusGridStyle(feature) {
   const population = feature.properties.population;
@@ -140,6 +158,18 @@ const gridLayer = L.geoJSON(null, {
       selectGrid(feature, layer);
     });
   },
+}).addTo(map);
+
+const selectedGridNeighborhoodLayerGroup = L.geoJSON(null, {
+  pane: "gridPane",
+  interactive: false,
+  style: (feature) => ({
+    color: feature.properties.selected ? "#f2a900" : "#f2a900",
+    weight: feature.properties.selected ? 3 : 1.4,
+    opacity: feature.properties.selected ? 1 : 0.78,
+    fillColor: "#f2a900",
+    fillOpacity: feature.properties.selected ? 0.16 : 0.055,
+  }),
 }).addTo(map);
 
 const boundaryLayer = L.geoJSON(null, {
@@ -174,34 +204,7 @@ const imageLayer = L.geoJSON(null, {
 
 const vlmResultLayer = L.geoJSON(null, {
   pane: "vlmResultPane",
-  pointToLayer: (feature, latlng) => {
-    if (feature.properties.observation_role === "center") {
-      const angle = Number(feature.properties.heading_deg);
-      const color = vlmThemeColor(feature.properties.theme_value);
-      return L.marker(latlng, {
-        pane: "vlmResultPane",
-        icon: L.divIcon({
-          className: "vlm-direction-marker",
-          html: `<span style="--vlm-color: ${escapeAttribute(color)}; transform: rotate(${Number.isFinite(angle) ? angle : 0}deg)">▲</span>`,
-          iconSize: [24, 24],
-          iconAnchor: [12, 12],
-        }),
-        keyboard: true,
-        title: `${feature.properties.image_id} center ${feature.properties.theme_value}`,
-      });
-    }
-    return L.circleMarker(latlng, {
-      pane: "vlmResultPane",
-      radius: 3.5,
-      color: "#18201d",
-      weight: 1.4,
-      fillColor: vlmThemeColor(feature.properties.theme_value),
-      fillOpacity: 0.9,
-      className: "vlm-result-point vlm-result-point-virtual",
-      interactive: true,
-      renderer: vlmResultRenderer,
-    });
-  },
+  pointToLayer: (feature, latlng) => thematicObservationLayer(feature, latlng, "vlmResultPane", vlmResultRenderer),
   onEachFeature: (feature, layer) => {
     layer.on("click", (event) => {
       L.DomEvent.stopPropagation(event);
@@ -224,10 +227,10 @@ const landuseLayer = L.geoJSON(null, {
   interactive: false,
   style: (feature) => ({
     color: landuseColor(feature.properties.class_name),
-    weight: 2,
-    opacity: 0.95,
+    weight: 1,
+    opacity: 0.38,
     fillColor: landuseColor(feature.properties.class_name),
-    fillOpacity: 0.42,
+    fillOpacity: 0.14,
   }),
   onEachFeature: (feature, layer) => {
     const properties = feature.properties;
@@ -243,11 +246,11 @@ const buildingLayer = L.geoJSON(null, {
   renderer: buildingRenderer,
   interactive: false,
   style: {
-    color: "#004c99",
-    weight: 2,
-    opacity: 1,
+    color: "#1971c2",
+    weight: 1,
+    opacity: 0.58,
     fillColor: "#1c7ed6",
-    fillOpacity: 0.58,
+    fillOpacity: 0.18,
   },
   onEachFeature: (feature, layer) => {
     const properties = feature.properties;
@@ -343,6 +346,110 @@ const roadMatchLayerGroup = L.layerGroup([
 selectedRoadLayer.addTo(map);
 roadMatchLinkLayer.addTo(map);
 
+const mapMatchRoadLayer = L.geoJSON(null, {
+  pane: "roadMatchPane",
+  renderer: roadMatchRenderer,
+  interactive: false,
+  style: {
+    color: "#1864ab",
+    weight: 7,
+    opacity: 0.32,
+    lineCap: "round",
+    lineJoin: "round",
+  },
+}).addTo(map);
+
+const mapMatchRawTrajectoryLayer = L.geoJSON(null, {
+  pane: "roadMatchPane",
+  renderer: roadMatchRenderer,
+  interactive: false,
+  style: {
+    color: "#f08c00",
+    weight: 4.2,
+    opacity: 0.9,
+    dashArray: "8 7",
+    lineCap: "round",
+    lineJoin: "round",
+  },
+}).addTo(map);
+
+const mapMatchMatchedTrajectoryLayer = L.geoJSON(null, {
+  pane: "roadMatchPane",
+  renderer: roadMatchRenderer,
+  interactive: false,
+  style: {
+    color: "#1c7ed6",
+    weight: 6.5,
+    opacity: 0.94,
+    lineCap: "round",
+    lineJoin: "round",
+  },
+}).addTo(map);
+
+const mapMatchLinkLayer = L.geoJSON(null, {
+  pane: "roadMatchPane",
+  renderer: roadMatchRenderer,
+  interactive: false,
+  style: {
+    color: "#1864ab",
+    weight: 1.6,
+    opacity: 0.7,
+    dashArray: "3 6",
+  },
+}).addTo(map);
+
+const mapMatchPointLayer = L.geoJSON(null, {
+  pane: "roadMatchPane",
+  pointToLayer: (feature, latlng) => L.circleMarker(latlng, {
+    pane: "roadMatchPane",
+    radius: 5,
+    color: "#ffffff",
+    weight: 1.6,
+    fillColor: mapMatchColor(feature.properties.capture_position),
+    fillOpacity: 0.95,
+    interactive: true,
+    renderer: roadMatchRenderer,
+  }),
+  onEachFeature: (feature, layer) => {
+    const properties = feature.properties || {};
+    layer.on("click", (event) => {
+      L.DomEvent.stopPropagation(event);
+      showMapMatchedImage(feature);
+    });
+    layer.bindTooltip(
+      `${properties.image_id}<br>${properties.capture_position || "unknown"}<br>segment ${properties.segment_index ?? 0}`,
+      { direction: "top", opacity: 0.9 }
+    );
+  },
+}).addTo(map);
+
+const confirmedMapMatchedPointLayer = L.geoJSON(null, {
+  pane: "roadMatchPane",
+  pointToLayer: (feature, latlng) => thematicObservationLayer(feature, latlng, "roadMatchPane", roadMatchRenderer),
+  onEachFeature: (feature, layer) => {
+    const properties = feature.properties || {};
+    layer.on("click", (event) => {
+      L.DomEvent.stopPropagation(event);
+      const source = allConfirmedMapMatchedPointFeatures.find((item) => (
+        String(item.properties?.image_id || item.id) === String(properties.image_id || feature.id)
+      ));
+      showMapMatchedImage(source || feature);
+    });
+    layer.bindTooltip(
+      `confirmed ${properties.image_id || feature.id}<br>${properties.observation_role || "center"}: ${properties.theme_value || "not processed"}`,
+      { direction: "top", opacity: 0.9 }
+    );
+  },
+}).addTo(map);
+
+const mapMatchLayerGroup = L.layerGroup([
+  mapMatchRoadLayer,
+  mapMatchRawTrajectoryLayer,
+  mapMatchMatchedTrajectoryLayer,
+  mapMatchLinkLayer,
+  mapMatchPointLayer,
+]).addTo(map);
+
 L.control.layers(
   { OpenStreetMap: osmBasemap },
   {
@@ -356,6 +463,8 @@ L.control.layers(
     "Mapillary images": imageLayer,
     "VLM result thematic points": vlmResultLayer,
     "Road-VLM match links": roadMatchLayerGroup,
+    "Raw/corrected matched trajectories": mapMatchLayerGroup,
+    "Confirmed map-matched points": confirmedMapMatchedPointLayer,
     "Road surface validation": roadSurfaceValidationLayer,
   },
   { collapsed: false, position: "topright" }
@@ -370,6 +479,7 @@ const confirmMapillaryButton = document.getElementById("confirm-mapillary-button
 const downloadLink = document.getElementById("download-link");
 const mapillaryGeometryModeSelect = document.getElementById("mapillary-geometry-mode");
 const mapillaryHealthElement = document.getElementById("mapillary-health");
+const graphhopperHealthElement = document.getElementById("graphhopper-health");
 const modelHealthElement = document.getElementById("model-health");
 const modelSelectElement = document.getElementById("model-select");
 const detailScrollElement = document.querySelector(".detail-scroll");
@@ -381,6 +491,12 @@ const deleteCellVlmButton = document.getElementById("delete-cell-vlm-button");
 const validateRoadSurfaceButton = document.getElementById("validate-road-surface-button");
 const surfaceValidationProgress = document.getElementById("surface-validation-progress");
 const surfaceValidationStatus = document.getElementById("surface-validation-status");
+const mapMatchingSequenceSelect = document.getElementById("map-matching-sequence-select");
+const runGraphhopperMatchingButton = document.getElementById("run-graphhopper-matching-button");
+const mapMatchingSegmentSelect = document.getElementById("map-matching-segment-select");
+const confirmCurrentMapMatchingButton = document.getElementById("confirm-current-mapmatching-button");
+const processCurrentTrajectoryVlmButton = document.getElementById("process-current-trajectory-vlm-button");
+const mapMatchingStatusElement = document.getElementById("map-matching-status");
 const vlmProgressElement = document.getElementById("vlm-progress");
 const vlmStatusElement = document.getElementById("vlm-status");
 const forceVlmCheckbox = document.getElementById("force-vlm-checkbox");
@@ -455,15 +571,31 @@ async function checkHealth() {
       ? "Mapillary 已配置"
       : "Mapillary 未配置";
     mapillaryHealthElement.classList.toggle("warning", !health.mapillary_configured);
+    updateGraphHopperHealth(health.graphhopper || {});
     updateModelPicker(ollama);
     updateProcessButtonState();
   } catch (_error) {
     mapillaryHealthElement.textContent = "Mapillary 状态未知";
     mapillaryHealthElement.classList.add("warning");
+    graphhopperHealthElement.textContent = "GraphHopper 状态未知";
+    graphhopperHealthElement.classList.add("warning");
     modelHealthElement.textContent = "模型状态未知";
     modelHealthElement.parentElement.classList.add("warning");
     modelSelectElement.disabled = true;
   }
+}
+
+function updateGraphHopperHealth(graphhopper) {
+  const configured = Boolean(graphhopper.configured);
+  const ok = Boolean(graphhopper.ok);
+  if (!configured) {
+    graphhopperHealthElement.textContent = "GraphHopper 未配置";
+  } else if (ok) {
+    graphhopperHealthElement.textContent = "GraphHopper 已连接";
+  } else {
+    graphhopperHealthElement.textContent = "GraphHopper 连接失败";
+  }
+  graphhopperHealthElement.classList.toggle("warning", !ok);
 }
 
 function updateModelPicker(ollama) {
@@ -539,11 +671,14 @@ function selectGrid(feature, layer) {
   imageLayer.clearLayers();
   currentImageFeature = null;
   currentImageFeatures = [];
+  currentConfirmedMapMatchingPointFeatures = [];
+  resetMapMatchingControls();
   vlmResultsByImageId = {};
   currentCellProcessPlan = emptyProcessPlan();
   activeVlmJobId = null;
   stopVlmJobPolling();
   clearRoadLayers();
+  clearMapMatching();
   buildingLayer.clearLayers();
   landuseLayer.clearLayers();
   imageCountElement.textContent = "0";
@@ -555,9 +690,9 @@ function selectGrid(feature, layer) {
   loadStatusElement.textContent = "已选择格网。点击“确认访问 Mapillary”后才会请求街景数据。";
   resetVlmPanel("VLM 尚未处理。先确认访问 Mapillary，再手动处理当前 cell。");
   mapDataStatusElement.classList.remove("error");
-  mapDataStatusElement.textContent = "正在从 PostGIS 读取该 cell 的 OSM 图层…";
+  mapDataStatusElement.textContent = "正在从 PostGIS 读取当前 cell 的 OSM 图层；3x3 仅作为格网高亮…";
   showAwaitingConfirmation();
-  zoomToCurrentGrid();
+  loadSelectedGridNeighborhood(properties.grid_id);
   loadCellMapLayers(properties.grid_id);
   loadVlmResults(properties.grid_id);
 }
@@ -565,7 +700,7 @@ function selectGrid(feature, layer) {
 async function loadCellMapLayers(gridId) {
   const sequence = ++cellMapSequence;
   try {
-    const result = await apiGet(`/api/mainz/grids/${encodeURIComponent(gridId)}/map-layers`);
+    const result = await apiGet(`/api/mainz/grids/${encodeURIComponent(gridId)}/map-layers?radius=${OSM_LAYER_RADIUS}`);
     if (sequence !== cellMapSequence) return;
     clearRoadLayers();
     buildingLayer.clearLayers();
@@ -585,11 +720,26 @@ async function loadCellMapLayers(gridId) {
     pedestrianRoadLayer.addData(featureCollection(roads.pedestrian));
     vehicleRoadLayer.addData(featureCollection(roads.vehicle));
     bicycleRoadLayer.addData(featureCollection(roads.bicycle));
-    mapDataStatusElement.textContent = `OSM cell图层：${result.meta.counts.roads} 条路（行人 ${roads.pedestrian.length}，车行 ${roads.vehicle.length}，自行车 ${roads.bicycle.length}），${result.meta.counts.buildings} 个建筑，${result.meta.counts.landuse} 个土地利用面。`;
+    mapDataStatusElement.textContent = `OSM 当前cell图层：${result.meta.counts.roads} 条路（行人 ${roads.pedestrian.length}，车行 ${roads.vehicle.length}，自行车 ${roads.bicycle.length}），${result.meta.counts.buildings} 个建筑，${result.meta.counts.landuse} 个土地利用面。3x3 只用于格网高亮。`;
   } catch (error) {
     if (sequence !== cellMapSequence) return;
     mapDataStatusElement.textContent = `OSM 图层加载失败：${error.message}`;
     mapDataStatusElement.classList.add("error");
+  }
+}
+
+async function loadSelectedGridNeighborhood(gridId) {
+  selectedGridNeighborhoodLayerGroup.clearLayers();
+  selectedGridNeighborhoodLayer = null;
+  try {
+    const result = await apiGet(`/api/grids/${encodeURIComponent(gridId)}/around?radius=${SELECTED_GRID_NEIGHBORHOOD_RADIUS}`);
+    selectedGridNeighborhoodLayerGroup.addData(result);
+    selectedGridNeighborhoodLayer = selectedGridNeighborhoodLayerGroup;
+    zoomToCurrentGrid();
+  } catch (error) {
+    zoomToCurrentGrid();
+    loadStatusElement.textContent = `3x3 格网范围加载失败：${error.message}`;
+    loadStatusElement.classList.add("error");
   }
 }
 
@@ -600,7 +750,7 @@ function createRoadLayer(renderer) {
     style: (feature) => ({
       color: roadColor(feature.properties.road_category),
       weight: roadWeight(feature.properties.road_category),
-      opacity: 1,
+      opacity: 0.62,
     }),
   }).addTo(map);
 }
@@ -611,6 +761,20 @@ function clearRoadLayers() {
   vehicleRoadLayer.clearLayers();
   bicycleRoadLayer.clearLayers();
   clearRoadVlmMatches();
+}
+
+function clearMapMatching() {
+  currentMapMatchingLayers = null;
+  currentMapMatchingSegmentSummaries = [];
+  currentMapMatchingSelectedSegment = null;
+  currentMapMatchingPointFeatures = [];
+  mapMatchRoadLayer.clearLayers();
+  mapMatchRawTrajectoryLayer.clearLayers();
+  mapMatchMatchedTrajectoryLayer.clearLayers();
+  mapMatchLinkLayer.clearLayers();
+  mapMatchPointLayer.clearLayers();
+  resetMapMatchingSegmentSelect();
+  updateMapMatchingButtonState();
 }
 
 function clearRoadVlmMatches() {
@@ -631,7 +795,7 @@ async function selectRoadForVlmMatching(feature, clickLatLng = null) {
   mapDataStatusElement.classList.remove("error");
   mapDataStatusElement.textContent = `正在匹配道路 ${properties.osm_id} 与 VLM 图像点…`;
   try {
-    const result = await apiGet(`/api/osm/roads/${encodeURIComponent(properties.osm_id)}/vlm-matches?max_distance_m=35&close_override_m=5&view_fov_deg=110&no_heading_visible_m=5&road_axis_tolerance_deg=35&limit=300`);
+    const result = await apiGet(`/api/osm/roads/${encodeURIComponent(properties.osm_id)}/vlm-matches?max_distance_m=8&close_override_m=4&view_fov_deg=110&no_heading_visible_m=3&road_axis_tolerance_deg=35&limit=300`);
     if (!selectedRoadFeature || selectedRoadFeature.properties.osm_id !== properties.osm_id) return;
     selectedRoadLayer.clearLayers();
     selectedRoadLayer.addData(result.road);
@@ -649,6 +813,291 @@ async function selectRoadForVlmMatching(feature, clickLatLng = null) {
     mapDataStatusElement.textContent = `道路匹配失败：${error.message}`;
     mapDataStatusElement.classList.add("error");
   }
+}
+
+function resetMapMatchingControls() {
+  clearMapMatching();
+  mapMatchingRunning = false;
+  if (mapMatchingSequenceSelect) {
+    mapMatchingSequenceSelect.innerHTML = '<option value="">先加载 Mapillary 图像</option>';
+    mapMatchingSequenceSelect.disabled = true;
+  }
+  if (mapMatchingStatusElement) {
+    mapMatchingStatusElement.classList.remove("error");
+    mapMatchingStatusElement.textContent = "加载当前 cell 的 Mapillary 图像后，可以手动组织 sequence 并运行 GraphHopper。";
+  }
+  updateMapMatchingButtonState();
+}
+
+function updateMapMatchingButtonState() {
+  if (!runGraphhopperMatchingButton) return;
+  runGraphhopperMatchingButton.disabled = mapMatchingRunning || !currentGrid || currentImageFeatures.length < 2;
+  if (confirmCurrentMapMatchingButton) {
+    confirmCurrentMapMatchingButton.disabled = Boolean(
+      mapMatchingRunning
+      || !currentGrid
+      || currentMapMatchingPointFeatures.length === 0
+    );
+  }
+  if (processCurrentTrajectoryVlmButton) {
+    processCurrentTrajectoryVlmButton.disabled = Boolean(
+      mapMatchingRunning
+      || !currentGrid
+      || !ollamaReady
+      || activeVlmJobId
+      || currentConfirmedMapMatchingPointFeatures.length === 0
+    );
+  }
+}
+
+function resetMapMatchingSegmentSelect() {
+  if (!mapMatchingSegmentSelect) return;
+  mapMatchingSegmentSelect.innerHTML = '<option value="">先运行轨迹匹配</option>';
+  mapMatchingSegmentSelect.disabled = true;
+}
+
+function updateMapMatchingSegmentOptions() {
+  if (!mapMatchingSegmentSelect) return;
+  const selectedBefore = mapMatchingSegmentSelect.value;
+  const summaries = currentMapMatchingSegmentSummaries.length
+    ? currentMapMatchingSegmentSummaries
+    : summarizeMapMatchingSegments(currentMapMatchingLayers);
+  currentMapMatchingSegmentSummaries = summaries;
+  mapMatchingSegmentSelect.innerHTML = "";
+  if (!summaries.length) {
+    resetMapMatchingSegmentSelect();
+    return;
+  }
+  summaries.forEach((summary, index) => {
+    const segmentIndex = Number(summary.segment_index ?? index);
+    const option = document.createElement("option");
+    option.value = String(segmentIndex);
+    const distance = summary.distance == null ? "" : ` · ${(Number(summary.distance) / 1000).toFixed(2)} km`;
+    const profile = summary.profile ? ` · ${summary.profile}` : "";
+    const status = summary.available === false ? " · 未匹配" : "";
+    const confirmed = confirmedSegmentStatus(segmentIndex);
+    const confirmedText = confirmed.total > 0
+      ? ` · 已确认 ${confirmed.confirmed}/${confirmed.total}`
+      : " · 未确认";
+    option.textContent = `segment ${segmentIndex} · ${summary.matched ?? 0}/${summary.count ?? 0} 点${profile}${distance}${status}${confirmedText}`;
+    mapMatchingSegmentSelect.append(option);
+  });
+  mapMatchingSegmentSelect.disabled = false;
+  if (selectedBefore && Array.from(mapMatchingSegmentSelect.options).some((option) => option.value === selectedBefore)) {
+    mapMatchingSegmentSelect.value = selectedBefore;
+  }
+  currentMapMatchingSelectedSegment = Number(mapMatchingSegmentSelect.value || summaries[0].segment_index || 0);
+}
+
+function confirmedSegmentStatus(segmentIndex) {
+  const expected = new Set(
+    (currentMapMatchingLayers?.points?.features || [])
+      .filter((feature) => Number(feature.properties?.segment_index ?? 0) === Number(segmentIndex))
+      .map((feature) => String(feature.properties?.image_id || feature.id || ""))
+      .filter(Boolean)
+  );
+  if (!expected.size) return { confirmed: 0, total: 0 };
+  const confirmed = new Set(
+    allConfirmedMapMatchedPointFeatures
+      .filter((feature) => {
+        const properties = feature.properties || {};
+        const confirmedSegment = Number(properties.segment_index ?? properties.mapmatched_segment_index ?? 0);
+        return confirmedSegment === Number(segmentIndex);
+      })
+      .map((feature) => String(feature.properties?.image_id || feature.id || ""))
+      .filter((imageId) => expected.has(imageId))
+  );
+  return { confirmed: confirmed.size, total: expected.size };
+}
+
+function summarizeMapMatchingSegments(layers) {
+  const points = layers?.points?.features || [];
+  const groups = new Map();
+  points.forEach((feature) => {
+    const properties = feature.properties || {};
+    const segmentIndex = Number(properties.segment_index ?? 0);
+    const summary = groups.get(segmentIndex) || {
+      segment_index: segmentIndex,
+      count: 0,
+      matched: 0,
+      available: false,
+      profile: properties.profile || null,
+      distance: null,
+    };
+    summary.count += 1;
+    if (properties.mapmatched_geometry?.coordinates) {
+      summary.matched += 1;
+      summary.available = true;
+    }
+    if (!summary.profile && properties.profile) summary.profile = properties.profile;
+    groups.set(segmentIndex, summary);
+  });
+  return Array.from(groups.values()).sort((a, b) => Number(a.segment_index) - Number(b.segment_index));
+}
+
+function renderSelectedMapMatchingSegment() {
+  const segmentIndex = Number(currentMapMatchingSelectedSegment ?? 0);
+  const layers = currentMapMatchingLayers || {};
+  mapMatchRoadLayer.clearLayers();
+  mapMatchRawTrajectoryLayer.clearLayers();
+  mapMatchMatchedTrajectoryLayer.clearLayers();
+  mapMatchLinkLayer.clearLayers();
+  mapMatchPointLayer.clearLayers();
+  mapMatchRoadLayer.addData(layers.matched_roads || featureCollection([]));
+  mapMatchRawTrajectoryLayer.addData(filterFeaturesBySegment(layers.raw_trajectory, segmentIndex));
+  mapMatchMatchedTrajectoryLayer.addData(filterFeaturesBySegment(layers.matched_trajectory, segmentIndex));
+  mapMatchLinkLayer.addData(filterFeaturesBySegment(layers.links, segmentIndex));
+  const selectedPoints = filterFeaturesBySegment(layers.points, segmentIndex);
+  mapMatchPointLayer.addData(selectedPoints);
+  currentMapMatchingPointFeatures = (selectedPoints.features || [])
+    .filter((feature) => feature.properties?.mapmatched_geometry?.coordinates);
+  mapMatchRawTrajectoryLayer.bringToFront();
+  mapMatchMatchedTrajectoryLayer.bringToFront();
+  mapMatchLinkLayer.bringToFront();
+  mapMatchPointLayer.bringToFront();
+  updateMapMatchingButtonState();
+}
+
+function filterFeaturesBySegment(collection, segmentIndex) {
+  const features = (collection?.features || []).filter((feature) => (
+    Number(feature.properties?.segment_index ?? 0) === Number(segmentIndex)
+  ));
+  return featureCollection(features);
+}
+
+function updateMapMatchingSequenceOptions() {
+  if (!mapMatchingSequenceSelect) return;
+  const groups = new Map();
+  currentImageFeatures.forEach((feature) => {
+    const sequenceId = String(feature.properties?.sequence_id || "").trim();
+    if (!sequenceId) return;
+    const group = groups.get(sequenceId) || [];
+    group.push(feature);
+    groups.set(sequenceId, group);
+  });
+
+  mapMatchingSequenceSelect.innerHTML = "";
+  if (!groups.size) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = "当前 cell 没有 sequence_id";
+    mapMatchingSequenceSelect.append(option);
+    mapMatchingSequenceSelect.disabled = true;
+    if (mapMatchingStatusElement) {
+      mapMatchingStatusElement.textContent = "当前 Mapillary 缓存没有真实 sequence_id；需要重新确认访问 Mapillary 刷新元数据。";
+    }
+    updateMapMatchingButtonState();
+    return;
+  }
+
+  const sorted = Array.from(groups.entries()).sort((a, b) => b[1].length - a[1].length || a[0].localeCompare(b[0]));
+  const auto = document.createElement("option");
+  auto.value = "";
+  auto.textContent = `自动选择最长 sequence（${sorted[0][1].length} 张）`;
+  mapMatchingSequenceSelect.append(auto);
+  sorted.forEach(([sequenceId, features]) => {
+    const option = document.createElement("option");
+    option.value = sequenceId;
+    option.textContent = `${sequenceId} · ${features.length} 张`;
+    option.disabled = features.length < 2;
+    mapMatchingSequenceSelect.append(option);
+  });
+  mapMatchingSequenceSelect.disabled = false;
+  if (mapMatchingStatusElement) {
+    mapMatchingStatusElement.classList.remove("error");
+    mapMatchingStatusElement.textContent = `当前 cell 有 ${sorted.length} 条 Mapillary sequence；点击按钮后才运行 GraphHopper。`;
+  }
+  updateMapMatchingButtonState();
+}
+
+async function runMapMatchingForCurrentGrid() {
+  if (!currentGrid || mapMatchingRunning) return;
+  const gridId = currentGrid.properties.grid_id;
+  const sequence = ++mapMatchingSequence;
+  mapMatchingRunning = true;
+  updateMapMatchingButtonState();
+  clearMapMatching();
+  if (!map.hasLayer(mapMatchLayerGroup)) map.addLayer(mapMatchLayerGroup);
+  const selectedSequence = mapMatchingSequenceSelect && mapMatchingSequenceSelect.value
+    ? mapMatchingSequenceSelect.value
+    : "";
+  const sequenceParam = selectedSequence ? `&sequence_id=${encodeURIComponent(selectedSequence)}` : "";
+  if (mapMatchingStatusElement) {
+    mapMatchingStatusElement.classList.remove("error");
+    mapMatchingStatusElement.textContent = "正在以当前 cell 选择 sequence，并从本地缓存扩展整条轨迹发送到 GraphHopper…";
+  }
+  try {
+    const result = await apiGet(`/api/grids/${encodeURIComponent(gridId)}/map-matching?limit=1000${sequenceParam}`);
+    if (sequence !== mapMatchingSequence) return;
+    clearMapMatching();
+    currentConfirmedMapMatchingPointFeatures = [];
+    const layers = result.layers || {};
+    currentMapMatchingLayers = layers;
+    currentMapMatchingSegmentSummaries = result.meta?.segment_summaries || [];
+    updateMapMatchingSegmentOptions();
+    renderSelectedMapMatchingSegment();
+    const rawCount = (layers.raw_trajectory?.features || []).length;
+    const matchedCount = (layers.matched_trajectory?.features || []).length;
+    if (!result.available) {
+      const rawText = rawCount > 0 ? "已显示橙色原始 Mapillary sequence；" : "";
+      const message = `Map matching：${rawText}没有蓝色 matched 轨迹：${result.reason || "GraphHopper 不可用"}。`;
+      mapDataStatusElement.textContent = message;
+      if (mapMatchingStatusElement) {
+        mapMatchingStatusElement.textContent = message;
+        mapMatchingStatusElement.classList.add("error");
+      }
+      zoomToMapMatchingResult();
+      updateMapMatchingButtonState();
+      return;
+    }
+    zoomToMapMatchingResult();
+    const distanceText = result.meta.distance == null ? "" : `，距离 ${(Number(result.meta.distance) / 1000).toFixed(2)} km`;
+    const segmentText = result.meta.segments == null
+      ? ""
+      : `，断轨后 ${result.meta.matched_segments || 0}/${result.meta.segments} 段成功`;
+    const cacheText = result.meta.sequence_cached_grid_count
+      ? `，跨 ${result.meta.sequence_cached_grid_count} 个缓存 cell`
+      : "";
+    const selectedSegmentText = currentMapMatchingSegmentSummaries.length > 1
+      ? ` 当前显示 segment ${currentMapMatchingSelectedSegment}，可在列表中切换后分别确认/处理。`
+      : "";
+    const message = `GraphHopper map matching 完成：sequence ${result.meta.sequence_id || "unknown"}，${result.meta.matched}/${result.meta.count} 个点${cacheText}，蓝色 matched 轨迹 ${matchedCount}${segmentText}${distanceText}。${selectedSegmentText}请检查预览点，确认后再保存位置。`;
+    mapDataStatusElement.textContent = message;
+    if (mapMatchingStatusElement) {
+      mapMatchingStatusElement.classList.remove("error");
+      mapMatchingStatusElement.textContent = message;
+    }
+    updateMapMatchingButtonState();
+  } catch (error) {
+    if (sequence !== mapMatchingSequence) return;
+    clearMapMatching();
+    if (mapMatchingStatusElement) {
+      mapMatchingStatusElement.textContent = `GraphHopper map matching 失败：${error.message}`;
+      mapMatchingStatusElement.classList.add("error");
+    }
+  } finally {
+    if (sequence === mapMatchingSequence) {
+      mapMatchingRunning = false;
+      updateMapMatchingButtonState();
+    }
+  }
+}
+
+function zoomToMapMatchingResult() {
+  const layers = [
+    mapMatchRawTrajectoryLayer,
+    mapMatchMatchedTrajectoryLayer,
+    mapMatchLinkLayer,
+    mapMatchPointLayer,
+  ];
+  const nonEmptyLayers = layers.filter((layer) => layer.getLayers().length > 0);
+  if (!nonEmptyLayers.length) return;
+  const bounds = L.featureGroup(nonEmptyLayers).getBounds();
+  if (!bounds.isValid()) return;
+  map.fitBounds(bounds, {
+    padding: [90, 90],
+    maxZoom: 18,
+  });
 }
 
 function updateSurfaceValidationButtonState() {
@@ -759,6 +1208,12 @@ function featureCollection(features) {
 function roadCategory(properties) {
   const highway = properties.highway;
   const tags = properties.tags || {};
+  if (["platform", "corridor", "elevator"].includes(highway)) {
+    return "pedestrian";
+  }
+  if (["yes", "designated"].includes(tags.psv) || ["yes", "designated"].includes(tags.bus) || tags.busway) {
+    return "vehicle";
+  }
   if (highway === "cycleway" || tags.bicycle === "designated") return "bicycle";
   if (["footway", "path", "steps", "pedestrian", "platform", "corridor", "elevator"].includes(highway)) {
     return "pedestrian";
@@ -803,6 +1258,7 @@ function roadObservationPopupHtml(properties) {
       <dl>
         <dt>投票道路</dt><dd>${escapeHtml(roadCategoryLabel(properties.road_category))}</dd>
         <dt>投票表面</dt><dd>${escapeHtml(properties.matched_road_surface_material || "null")}</dd>
+        <dt>候选权重</dt><dd>${escapeHtml(formatCounts(properties.matched_road_surface_votes || {}))}</dd>
         <dt>观测来源</dt><dd>${escapeHtml(properties.matched_road_surface_source || "null")}</dd>
         <dt>原始拍摄位置</dt><dd>${escapeHtml(properties.capture_position || "null")}</dd>
         <dt>原始脚下表面</dt><dd>${escapeHtml(properties.surface_material || "null")}</dd>
@@ -841,8 +1297,14 @@ function formatRoadStats(stats) {
 function formatCounts(counts) {
   return Object.entries(counts)
     .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
-    .map(([key, value]) => `${key}: ${value}`)
+    .map(([key, value]) => `${key}: ${formatCountValue(value)}`)
     .join(" · ");
+}
+
+function formatCountValue(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return String(value);
+  return Number.isInteger(numeric) ? String(numeric) : numeric.toFixed(2).replace(/0+$/, "").replace(/\.$/, "");
 }
 
 function surfaceValidationPopupHtml(properties) {
@@ -865,9 +1327,10 @@ function surfaceValidationPopupHtml(properties) {
 }
 
 function zoomToCurrentGrid() {
-  if (!selectedGridLayer) return;
-  map.fitBounds(selectedGridLayer.getBounds(), {
-    padding: [140, 140],
+  const boundsLayer = selectedGridNeighborhoodLayer || selectedGridLayer;
+  if (!boundsLayer) return;
+  map.fitBounds(boundsLayer.getBounds(), {
+    padding: [80, 80],
     maxZoom: 17,
   });
 }
@@ -905,6 +1368,8 @@ async function loadImages() {
     if (sequence !== requestSequence) return;
     currentImageFeatures = result.features || [];
     renderImageLayer();
+    clearMapMatching();
+    updateMapMatchingSequenceOptions();
     imageCountElement.textContent = result.meta.count;
     const cacheText = result.meta.cache === "hit" ? "容器缓存" : "Mapillary API";
     const truncated = result.meta.truncated ? "；结果达到 API 上限" : "";
@@ -919,6 +1384,7 @@ async function loadImages() {
   } catch (error) {
     if (sequence !== requestSequence) return;
     currentImageFeatures = [];
+    resetMapMatchingControls();
     currentCellProcessPlan = emptyProcessPlan();
     updateProcessButtonState();
     imageCountElement.textContent = "0";
@@ -953,6 +1419,52 @@ async function loadVlmResults(gridId) {
   }
 }
 
+async function loadConfirmedMapMatchedPoints() {
+  try {
+    const result = await apiGet("/api/mapillary/mapmatched-positions?limit=50000");
+    const features = result.features || result.geojson?.features || [];
+    allConfirmedMapMatchedPointFeatures = features;
+    renderConfirmedMapMatchedPointLayer();
+    updateMapMatchingSegmentOptions();
+  } catch (error) {
+    mapDataStatusElement.textContent = `已确认 map-matched 点加载失败：${error.message}`;
+    mapDataStatusElement.classList.add("error");
+  }
+}
+
+function renderConfirmedMapMatchedPointLayer() {
+  confirmedMapMatchedPointLayer.clearLayers();
+  const includeVirtual = map.getZoom() >= VLM_RENDER_VIRTUAL_MIN_ZOOM;
+  const features = [];
+  for (const sourceFeature of allConfirmedMapMatchedPointFeatures) {
+    const properties = sourceFeature.properties || {};
+    const imageId = String(properties.image_id || sourceFeature.id || "");
+    const analysis = allVlmResultsByImageId[imageId];
+    if (analysis) {
+      const themed = vlmObservationFeatures(analysis, sourceFeature.geometry, includeVirtual)
+        .map((feature) => ({
+          ...feature,
+          id: `confirmed:${imageId}:${feature.properties.observation_role}`,
+        }));
+      features.push(...themed);
+    } else {
+      features.push({
+        type: "Feature",
+        id: `confirmed:${imageId}:center`,
+        geometry: sourceFeature.geometry,
+        properties: {
+          image_id: imageId,
+          observation_role: "center",
+          heading_deg: properties.computed_compass_angle ?? properties.compass_angle ?? 0,
+          theme_field: "mapmatched_position",
+          theme_value: "confirmed",
+        },
+      });
+    }
+  }
+  confirmedMapMatchedPointLayer.addData(featureCollection(features));
+}
+
 async function loadAllVlmResults() {
   const sequence = ++allVlmResultsSequence;
   try {
@@ -960,6 +1472,7 @@ async function loadAllVlmResults() {
     if (sequence !== allVlmResultsSequence) return;
     allVlmResultsByImageId = result.results || {};
     renderVlmResultLayer();
+    renderConfirmedMapMatchedPointLayer();
     updateGlobalVlmStatus(result.count || 0);
   } catch (error) {
     if (sequence !== allVlmResultsSequence) return;
@@ -1000,8 +1513,10 @@ function renderVlmJobs(jobs) {
   }
   vlmJobsElement.innerHTML = jobs.map((job) => {
     const total = Number(job.total || 0);
-    const processed = Number(job.processed || 0);
-    const percent = total > 0 ? (processed / total) * 100 : 0;
+    const skipped = Number(job.skipped || 0);
+    const attempted = Number(job.analyzed || 0);
+    const effectiveTotal = Math.max(total - skipped, attempted, 0);
+    const percent = effectiveTotal > 0 ? (attempted / effectiveTotal) * 100 : 0;
     const current = job.current_image_id ? ` · 当前 ${job.current_image_id}` : "";
     const error = job.error ? ` · ${job.error}` : "";
     const requestAvg = averageAnalyzedJobSeconds(job);
@@ -1012,11 +1527,11 @@ function renderVlmJobs(jobs) {
     const actionText = job.status === "running" ? "中断" : job.status === "cancelling" ? "中断中" : "取消";
     return `
       <div class="job-item job-${escapeAttribute(job.status || "unknown")}">
-        <strong>${escapeHtml(job.status)} · ${processed}/${total} (${percent.toFixed(1)}%)</strong>
+        <strong>${escapeHtml(job.status)} · ${attempted}/${effectiveTotal} (${percent.toFixed(1)}%)</strong>
         ${canCancel ? `<button type="button" data-cancel-vlm-job="${escapeAttribute(job.job_id)}"${job.status === "cancelling" ? " disabled" : ""}>${escapeHtml(actionText)}</button>` : ""}
-        <progress class="job-progress" value="${escapeAttribute(processed)}" max="${escapeAttribute(Math.max(total, 1))}"></progress>
+        <progress class="job-progress" value="${escapeAttribute(attempted)}" max="${escapeAttribute(Math.max(effectiveTotal, 1))}"></progress>
         <div class="job-meta">${escapeHtml(job.grid_id || "unknown grid")} · ${escapeHtml(job.model || "model unknown")}</div>
-        <div class="job-meta">${escapeHtml(throughputAvgText)} · ${escapeHtml(requestAvgText)} · 分析 ${Number(job.analyzed || 0)} · 跳过 ${Number(job.skipped || 0)} · 失败 ${Number(job.failed || 0)}${escapeHtml(current)}${escapeHtml(error)}</div>
+        <div class="job-meta">${escapeHtml(throughputAvgText)} · ${escapeHtml(requestAvgText)} · 分析 ${attempted} · 跳过 ${skipped} · 失败 ${Number(job.failed || 0)}${escapeHtml(current)}${escapeHtml(error)}</div>
         <div class="job-meta">更新 ${escapeHtml(job.updated_at ? formatDate(job.updated_at) : "null")}</div>
       </div>
     `;
@@ -1036,7 +1551,7 @@ function averageAnalyzedJobSeconds(job) {
 }
 
 function averageThroughputSeconds(job) {
-  const completedWork = Number(job.analyzed || 0) + Number(job.skipped || 0);
+  const completedWork = Number(job.analyzed || 0);
   const failed = Number(job.failed || 0);
   const countedWork = Math.max(completedWork - failed, 0);
   if (countedWork <= 0 || !job.started_at) return null;
@@ -1222,6 +1737,119 @@ async function startCellVlmJob() {
   }
 }
 
+function mapMatchedFeatureToVlmImage(feature) {
+  const properties = feature.properties || {};
+  const imageId = String(properties.image_id || feature.id || "");
+  if (!imageId) return null;
+  const gpsGeometry = properties.gps_geometry || properties.original_geometry || feature.geometry || null;
+  const mapillaryGeometry = properties.mapillary_geometry || properties.computed_geometry || null;
+  const mapmatchedGeometry = properties.mapmatched_geometry || null;
+  const geometry = mapmatchedGeometry || mapillaryGeometry || gpsGeometry || feature.geometry || null;
+  if (!geometry?.coordinates) return null;
+  return {
+    type: "Feature",
+    id: imageId,
+    geometry,
+    properties: {
+      ...properties,
+      id: imageId,
+      image_id: imageId,
+      original_geometry: properties.original_geometry || gpsGeometry,
+      gps_geometry: gpsGeometry,
+      computed_geometry: properties.computed_geometry || mapillaryGeometry,
+      mapillary_geometry: mapillaryGeometry,
+      mapmatched_geometry: mapmatchedGeometry,
+      mapmatched_segment_index: properties.segment_index,
+      mapmatched_idx: properties.idx,
+      mapmatched_profile: properties.profile,
+    },
+  };
+}
+
+function currentTrajectoryVlmImages() {
+  const seen = new Set();
+  return currentConfirmedMapMatchingPointFeatures
+    .slice()
+    .sort((a, b) => (
+      Number(a.properties?.segment_index ?? 0) - Number(b.properties?.segment_index ?? 0)
+      || Number(a.properties?.idx ?? 0) - Number(b.properties?.idx ?? 0)
+    ))
+    .map(mapMatchedFeatureToVlmImage)
+    .filter((feature) => {
+      if (!feature || seen.has(String(feature.id))) return false;
+      seen.add(String(feature.id));
+      return true;
+    });
+}
+
+async function startCurrentTrajectoryVlmJob() {
+  if (!currentGrid || activeVlmJobId || currentConfirmedMapMatchingPointFeatures.length === 0) return;
+  const imagesToProcess = currentTrajectoryVlmImages();
+  if (imagesToProcess.length === 0) {
+    if (mapMatchingStatusElement) {
+      mapMatchingStatusElement.classList.add("error");
+      mapMatchingStatusElement.textContent = "当前还没有已确认保存的 map-matched 图像点。";
+    }
+    return;
+  }
+  const gridId = currentGrid.properties.grid_id;
+  selectedModel = modelSelectElement.value || selectedModel;
+  resetVlmProgress(0, Math.max(imagesToProcess.length, 1));
+  processCurrentTrajectoryVlmButton.disabled = true;
+  vlmStatusElement.classList.remove("error");
+  vlmStatusElement.textContent = `正在把已确认轨迹 ${imagesToProcess.length} 张图片加入当前 cell 的 VLM 队列；已有结果会更新位置元数据，不重复调用模型。`;
+
+  try {
+    const job = await apiPost(`/api/grids/${encodeURIComponent(gridId)}/vlm-jobs`, {
+      images: imagesToProcess,
+      model: selectedModel,
+      force: forceVlmCheckbox.checked,
+    });
+    activeVlmJobId = job.job_id;
+    await loadVlmJobs();
+    updateVlmJobUi(job);
+    pollVlmJob(activeVlmJobId, gridId);
+  } catch (error) {
+    activeVlmJobId = null;
+    vlmStatusElement.textContent = `当前轨迹 VLM 任务创建失败：${error.message}`;
+    vlmStatusElement.classList.add("error");
+    updateProcessButtonState();
+    updateMapMatchingButtonState();
+  }
+}
+
+async function confirmCurrentMapMatching() {
+  if (!currentGrid || currentMapMatchingPointFeatures.length === 0 || mapMatchingRunning) return;
+  const gridId = currentGrid.properties.grid_id;
+  const features = currentMapMatchingPointFeatures
+    .map(mapMatchedFeatureToVlmImage)
+    .filter(Boolean);
+  if (features.length === 0) {
+    mapMatchingStatusElement.classList.add("error");
+    mapMatchingStatusElement.textContent = "当前预览轨迹没有可保存的 map-matched 点。";
+    return;
+  }
+  confirmCurrentMapMatchingButton.disabled = true;
+  mapMatchingStatusElement.classList.remove("error");
+  mapMatchingStatusElement.textContent = `正在保存 ${features.length} 个已确认 map-matched 点到数据库…`;
+  try {
+    const result = await apiPost(`/api/grids/${encodeURIComponent(gridId)}/mapmatched-positions`, {
+      features,
+    });
+    currentConfirmedMapMatchingPointFeatures = result.features || [];
+    await loadConfirmedMapMatchedPoints();
+    updateMapMatchingSegmentOptions();
+    if (!map.hasLayer(confirmedMapMatchedPointLayer)) map.addLayer(confirmedMapMatchedPointLayer);
+    confirmedMapMatchedPointLayer.bringToFront();
+    mapMatchingStatusElement.textContent = `已确认保存 ${result.count || currentConfirmedMapMatchingPointFeatures.length} 个 map-matched 点；现在可以点击 Process 已确认轨迹图片。`;
+    updateMapMatchingButtonState();
+  } catch (error) {
+    mapMatchingStatusElement.textContent = `保存确认匹配点失败：${error.message}`;
+    mapMatchingStatusElement.classList.add("error");
+    updateMapMatchingButtonState();
+  }
+}
+
 function pollVlmJob(jobId, gridId) {
   stopVlmJobPolling();
   vlmJobTimer = window.setInterval(async () => {
@@ -1256,9 +1884,11 @@ function pollVlmJob(jobId, gridId) {
 function updateVlmJobUi(job) {
   refreshCellProcessPlan();
   const total = Number(job.total || 0);
-  const processed = Number(job.processed || 0);
-  resetVlmProgress(processed, Math.max(total, 1));
-  const serverPercent = total > 0 ? (processed / total) * 100 : 0;
+  const skippedCount = Number(job.skipped || 0);
+  const attempted = Number(job.analyzed || 0);
+  const effectiveTotal = Math.max(total - skippedCount, attempted, 0);
+  resetVlmProgress(attempted, Math.max(effectiveTotal, 1));
+  const serverPercent = effectiveTotal > 0 ? (attempted / effectiveTotal) * 100 : 0;
   const progressPercent = currentCellProcessPlan.totalClusters > 0
     ? (currentCellProcessPlan.processedClusters / currentCellProcessPlan.totalClusters) * 100
     : 0;
@@ -1272,7 +1902,7 @@ function updateVlmJobUi(job) {
   const requestAvgText = requestAvg == null ? "单请求平均 --/图" : `单请求平均 ${formatDuration(requestAvg)}/图`;
   const throughputAvgText = throughputAvg == null ? "吞吐平均 --/图" : `吞吐平均 ${formatDuration(throughputAvg)}/图`;
   vlmStatusElement.classList.toggle("error", job.status === "failed");
-  vlmStatusElement.textContent = `VLM ${job.status}：服务器进度 ${processed}/${total} (${serverPercent.toFixed(1)}%)${analyzed}${skipped}${failed}；${throughputAvgText}；${requestAvgText}${current}${completed}；${CELL_PROCESS_DISTANCE_METERS}m代表点覆盖 ${currentCellProcessPlan.processedClusters}/${currentCellProcessPlan.totalClusters} (${progressPercent.toFixed(1)}%)；有效覆盖 ${currentCellProcessPlan.usableClusters}；不可用耗尽 ${currentCellProcessPlan.unusableExhaustedClusters}`;
+  vlmStatusElement.textContent = `VLM ${job.status}：服务器分析进度 ${attempted}/${effectiveTotal} (${serverPercent.toFixed(1)}%)${analyzed}${skipped}${failed}；${throughputAvgText}；${requestAvgText}${current}${completed}；${CELL_PROCESS_DISTANCE_METERS}m代表点覆盖 ${currentCellProcessPlan.processedClusters}/${currentCellProcessPlan.totalClusters} (${progressPercent.toFixed(1)}%)；有效覆盖 ${currentCellProcessPlan.usableClusters}；不可用耗尽 ${currentCellProcessPlan.unusableExhaustedClusters}`;
 }
 
 function resetVlmPanel(message) {
@@ -1319,6 +1949,7 @@ function updateProcessButtonState() {
   if (deleteCellVlmButton) {
     deleteCellVlmButton.disabled = !currentGrid || activeVlmJobId || Object.keys(vlmResultsByImageId).length === 0;
   }
+  updateMapMatchingButtonState();
 }
 
 function showImage(feature) {
@@ -1377,6 +2008,9 @@ function showStoredVlmPoint(imageId) {
     <dl class="metadata">
       <dt>grid_id</dt><dd>${escapeHtml(analysis.grid_id || "null")}</dd>
       <dt>坐标</dt><dd>${escapeHtml(formatCoordinates(analysis.geometry?.coordinates))}</dd>
+      <dt>原始 GPS</dt><dd>${escapeHtml(formatCoordinates((properties.gps_geometry || properties.original_geometry)?.coordinates))}</dd>
+      <dt>Mapillary 校正</dt><dd>${escapeHtml(formatCoordinates((properties.mapillary_geometry || properties.computed_geometry)?.coordinates))}</dd>
+      <dt>蓝线采样坐标</dt><dd>${escapeHtml(formatCoordinates(properties.mapmatched_geometry?.coordinates))}</dd>
       <dt>拍摄时间</dt><dd>${escapeHtml(properties.captured_at ? formatDate(properties.captured_at) : "未知")}</dd>
       <dt>拍摄方向</dt><dd>${properties.compass_angle == null ? "未知" : `${Number(properties.compass_angle).toFixed(1)}°`}</dd>
       <dt>相机类型</dt><dd>${escapeHtml(properties.camera_type || "未知")}</dd>
@@ -1385,6 +2019,50 @@ function showStoredVlmPoint(imageId) {
     </dl>
     <a class="open-mapillary" href="${escapeAttribute(mapillaryUrl)}" target="_blank" rel="noreferrer">在 Mapillary 街景中打开</a>
     ${renderImageVlmActions(String(imageId), Boolean(analysis), false)}
+    ${renderVlmResult(analysis)}
+  `;
+  updateProcessButtonState();
+  scrollImageDetailIntoView();
+}
+
+function showMapMatchedImage(feature) {
+  const properties = feature.properties || {};
+  const imageId = String(properties.image_id || feature.id || "");
+  const sourceFeature = currentImageFeatures.find((item) => String(item.id) === imageId);
+  currentImageFeature = sourceFeature || mapMatchedFeatureToVlmImage(feature);
+  const rawCoordinates = feature.geometry?.coordinates;
+  const snappedCoordinates = properties.snapped_geometry?.coordinates;
+  const mapmatchedCoordinates = properties.mapmatched_geometry?.coordinates;
+  const thumbnailUrl = properties.thumb_1024_url || properties.thumb_256_url;
+  const thumbnail = thumbnailUrl
+    ? `<img src="${escapeAttribute(thumbnailUrl)}" alt="Mapillary 图像 ${escapeHtml(imageId)}">`
+    : '<div class="placeholder"><strong>无缩略图</strong><span>当前缓存里没有该图片 URL。</span></div>';
+  const mapillaryUrl = properties.mapillary_url || `https://www.mapillary.com/app/?pKey=${encodeURIComponent(imageId)}`;
+  const analysis = vlmResultsByImageId[imageId] || allVlmResultsByImageId[imageId] || null;
+
+  imageDetailElement.className = "image-detail";
+  imageDetailElement.innerHTML = `
+    ${thumbnail}
+    <h2>Map matching 图像 ${escapeHtml(imageId)}</h2>
+    <dl class="metadata">
+      <dt>轨迹序号</dt><dd>${escapeHtml(String(properties.idx ?? "null"))}</dd>
+      <dt>拍摄时间</dt><dd>${escapeHtml(properties.captured_at ? formatDate(properties.captured_at) : "未知")}</dd>
+      <dt>原始 GPS</dt><dd>${escapeHtml(formatCoordinates(rawCoordinates))}</dd>
+      <dt>Mapillary 校正</dt><dd>${escapeHtml(formatCoordinates(properties.mapillary_geometry?.coordinates))}</dd>
+      <dt>蓝线采样坐标</dt><dd>${escapeHtml(formatCoordinates(mapmatchedCoordinates))}</dd>
+      <dt>匹配后坐标</dt><dd>${escapeHtml(formatCoordinates(snappedCoordinates))}</dd>
+      <dt>匹配道路</dt><dd>${escapeHtml(roadCategoryLabel(properties.road_category))} · ${escapeHtml(properties.highway || "unknown")}</dd>
+      <dt>OSM surface</dt><dd>${escapeHtml(properties.surface || "unknown")}</dd>
+      <dt>距离</dt><dd>${escapeHtml(String(properties.distance_m ?? "null"))} m</dd>
+      <dt>score</dt><dd>${escapeHtml(String(properties.score ?? "null"))}</dd>
+      <dt>VLM位置</dt><dd>${escapeHtml(properties.capture_position || "null")}</dd>
+      <dt>VLM表面</dt><dd>${escapeHtml(properties.surface_material || "null")}</dd>
+      <dt>相机方向</dt><dd>${properties.heading_deg == null ? "未知" : `${Number(properties.heading_deg).toFixed(1)}°`}</dd>
+      <dt>轨迹方向</dt><dd>${properties.track_heading_deg == null ? "未知" : `${Number(properties.track_heading_deg).toFixed(1)}°`}</dd>
+      <dt>sequence</dt><dd>${escapeHtml(String(properties.sequence_id || "未知"))}</dd>
+    </dl>
+    <a class="open-mapillary" href="${escapeAttribute(mapillaryUrl)}" target="_blank" rel="noreferrer">在 Mapillary 街景中打开</a>
+    ${renderImageVlmActions(imageId, Boolean(analysis), Boolean(currentImageFeature))}
     ${renderVlmResult(analysis)}
   `;
   updateProcessButtonState();
@@ -1510,6 +2188,7 @@ function formatVlmValue(analysis, field) {
   if (!analysis || !analysis.fields || analysis.fields[field] == null) return "null";
   const value = analysis.fields[field];
   if (field === "confidence" && typeof value === "number") return value.toFixed(2);
+  if (typeof value === "object") return JSON.stringify(value);
   return String(value);
 }
 
@@ -1552,22 +2231,62 @@ function formatCoordinates(coordinates) {
     : "null";
 }
 
+function thematicObservationLayer(feature, latlng, pane, renderer) {
+  const properties = feature.properties || {};
+  if (properties.observation_role === "center") {
+    const angle = Number(properties.heading_deg);
+    const color = vlmThemeColor(properties.theme_value);
+    return L.marker(latlng, {
+      pane,
+      icon: L.divIcon({
+        className: "vlm-direction-marker",
+        html: `<span style="--vlm-color: ${escapeAttribute(color)}; transform: rotate(${Number.isFinite(angle) ? angle : 0}deg)">▲</span>`,
+        iconSize: [24, 24],
+        iconAnchor: [12, 12],
+      }),
+      keyboard: true,
+      title: `${properties.image_id} center ${properties.theme_value}`,
+    });
+  }
+  return L.circleMarker(latlng, {
+    pane,
+    radius: 3.5,
+    color: "#18201d",
+    weight: 1.4,
+    fillColor: vlmThemeColor(properties.theme_value),
+    fillOpacity: 0.9,
+    className: "vlm-result-point vlm-result-point-virtual",
+    interactive: true,
+    renderer,
+  });
+}
+
 function renderVlmResultLayer() {
   if (!map.hasLayer(vlmResultLayer)) return;
   vlmResultLayer.clearLayers();
   const renderBounds = map.getBounds().pad(VLM_RENDER_BOUNDS_PADDING);
+  const includeVirtual = map.getZoom() >= VLM_RENDER_VIRTUAL_MIN_ZOOM;
   const imageFeatureById = new Map(currentImageFeatures.map((feature) => [String(feature.id), feature]));
-  const features = Object.values(allVlmResultsByImageId).flatMap((analysis) => {
+  const features = [];
+  for (const analysis of Object.values(allVlmResultsByImageId)) {
     const imageFeature = imageFeatureById.get(String(analysis.image_id));
-    const geometry = imageFeature ? displayGeometry(imageFeature) : analysis.geometry;
-    if (!geometry) return [];
-    return vlmObservationFeatures(analysis, geometry)
+    const storedProperties = analysis.image_properties || {};
+    const geometry = storedProperties.mapmatched_geometry
+      || analysis.geometry
+      || (imageFeature ? displayGeometry(imageFeature) : null);
+    if (!geometry) continue;
+    const visibleFeatures = vlmObservationFeatures(analysis, geometry, includeVirtual)
       .filter((feature) => geometryInBounds(feature.geometry, renderBounds))
       .map((feature) => ({
         ...feature,
         id: `${analysis.image_id}:${feature.properties.observation_role}`,
       }));
-  });
+    for (const feature of visibleFeatures) {
+      features.push(feature);
+      if (features.length >= VLM_RENDER_FEATURE_LIMIT) break;
+    }
+    if (features.length >= VLM_RENDER_FEATURE_LIMIT) break;
+  }
   vlmResultLayer.addData({ type: "FeatureCollection", features });
 }
 
@@ -1586,9 +2305,11 @@ function geometryInBounds(geometry, bounds) {
   return bounds.contains([Number(lat), Number(lon)]);
 }
 
-function vlmObservationFeatures(analysis, centerGeometry) {
+function vlmObservationFeatures(analysis, centerGeometry, includeVirtual = true) {
   const centerValue = formatVlmValue(analysis, selectedVlmTheme);
-  const features = [{
+  const features = [];
+  if (isDisplayableVlmThemeValue(centerValue)) {
+    features.push({
       type: "Feature",
       geometry: centerGeometry,
       properties: {
@@ -1600,11 +2321,14 @@ function vlmObservationFeatures(analysis, centerGeometry) {
         theme_value: centerValue,
         updated_at: analysis.updated_at,
       },
-  }];
-  const heading = analysisHeading(analysis);
-  for (const side of ["left", "right"]) {
-    const virtual = virtualVlmObservation(analysis, centerGeometry, heading, side);
-    if (virtual) features.push(virtual);
+    });
+  }
+  if (includeVirtual) {
+    const heading = analysisHeading(analysis);
+    for (const side of ["left", "right"]) {
+      const virtual = virtualVlmObservation(analysis, centerGeometry, heading, side);
+      if (virtual) features.push(virtual);
+    }
   }
   return features;
 }
@@ -1620,13 +2344,15 @@ function virtualVlmObservation(analysis, centerGeometry, heading, side) {
     field = `${side}_sidewalk_surface_material`;
     value = fields[field];
     roleValue = "pedestrian_road";
-  } else if (fields.capture_position === "pedestrian_road" && ["vehicle_road", "bicycle_road"].includes(fields[`${side}_adjacent_road_type`])) {
+  } else if (["pedestrian_road", "bicycle_road"].includes(fields.capture_position)
+    && ["vehicle_road", "pedestrian_road", "bicycle_road"].includes(fields[`${side}_adjacent_road_type`])) {
     field = `${side}_adjacent_road_surface_material`;
     value = fields[field];
     roleValue = fields[`${side}_adjacent_road_type`];
   }
   if (value == null) return null;
   const themed = virtualThemeValue(analysis, side, field, value, roleValue);
+  if (!isDisplayableVlmThemeValue(themed.value)) return null;
   return {
     type: "Feature",
     geometry,
@@ -1663,6 +2389,10 @@ function virtualThemeValue(analysis, side, defaultField, defaultValue, roleValue
     return { field: selectedVlmTheme, value: formatVlmValue(analysis, selectedVlmTheme) };
   }
   return { field: defaultField, value: String(defaultValue) };
+}
+
+function isDisplayableVlmThemeValue(value) {
+  return String(value) !== "uncertain";
 }
 
 function analysisHeading(analysis) {
@@ -1708,6 +2438,7 @@ function vlmThemeColor(value) {
     yes: "#087f5b",
     no: "#adb5bd",
     uncertain: "#4263eb",
+    confirmed: "#0b7285",
     null: "#dee2e6",
   };
   return colors[value] || "#1c7ed6";
@@ -1754,11 +2485,18 @@ function roadColor(category) {
   return "#e03131";
 }
 
+function mapMatchColor(capturePosition) {
+  if (capturePosition === "pedestrian_road") return "#9c36b5";
+  if (capturePosition === "bicycle_road") return "#087f5b";
+  if (capturePosition === "vehicle_road") return "#e03131";
+  return "#495057";
+}
+
 function roadWeight(category) {
   const zoomBoost = map.getZoom() >= 17 ? 1.4 : 1;
-  if (category === "vehicle") return 4.6 * zoomBoost;
-  if (category === "bicycle") return 4 * zoomBoost;
-  return 3.5 * zoomBoost;
+  if (category === "vehicle") return 3.2 * zoomBoost;
+  if (category === "bicycle") return 2.8 * zoomBoost;
+  return 2.6 * zoomBoost;
 }
 
 function landuseColor(className) {
@@ -1796,6 +2534,18 @@ processCellVlmButton.addEventListener("click", startCellVlmJob);
 processCurrentImageButton.addEventListener("click", startCurrentImageVlmJob);
 deleteCellVlmButton?.addEventListener("click", deleteCurrentCellVlmResults);
 validateRoadSurfaceButton?.addEventListener("click", runRoadSurfaceValidation);
+runGraphhopperMatchingButton?.addEventListener("click", runMapMatchingForCurrentGrid);
+confirmCurrentMapMatchingButton?.addEventListener("click", confirmCurrentMapMatching);
+processCurrentTrajectoryVlmButton?.addEventListener("click", startCurrentTrajectoryVlmJob);
+mapMatchingSegmentSelect?.addEventListener("change", () => {
+  currentMapMatchingSelectedSegment = Number(mapMatchingSegmentSelect.value || 0);
+  currentConfirmedMapMatchingPointFeatures = [];
+  renderSelectedMapMatchingSegment();
+  if (mapMatchingStatusElement) {
+    mapMatchingStatusElement.classList.remove("error");
+    mapMatchingStatusElement.textContent = `当前显示 segment ${currentMapMatchingSelectedSegment}。请检查这一段，确认保存后再单独 process。`;
+  }
+});
 imageDetailElement.addEventListener("click", (event) => {
   const button = event.target.closest("button[data-image-action]");
   if (!button) return;
@@ -1829,6 +2579,8 @@ vlmJobsElement?.addEventListener("click", (event) => {
 mapillaryGeometryModeSelect.addEventListener("change", () => {
   mapillaryGeometryMode = mapillaryGeometryModeSelect.value === "computed" ? "computed" : "original";
   renderImageLayer();
+  clearMapMatching();
+  updateMapMatchingSequenceOptions();
   scheduleVlmResultLayerRender();
   refreshCellProcessPlan();
   if (currentImageFeature) showImage(currentImageFeature);
@@ -1838,16 +2590,18 @@ vlmThemeSelect.addEventListener("change", () => {
     ? vlmThemeSelect.value
     : "capture_position";
   scheduleVlmResultLayerRender();
+  renderConfirmedMapMatchedPointLayer();
 });
 map.on("zoomend", () => {
   [pedestrianRoadLayer, vehicleRoadLayer, bicycleRoadLayer].forEach((layer) => {
     layer.setStyle((feature) => ({
       color: roadColor(feature.properties.road_category),
       weight: roadWeight(feature.properties.road_category),
-      opacity: 1,
+      opacity: 0.62,
     }));
   });
   scheduleVlmResultLayerRender();
+  renderConfirmedMapMatchedPointLayer();
 });
 map.on("moveend", scheduleVlmResultLayerRender);
 map.on("overlayadd", (event) => {
@@ -1863,6 +2617,7 @@ map.on("click", (event) => {
 });
 checkHealth();
 initializeMainz();
+loadConfirmedMapMatchedPoints();
 loadAllVlmResults();
 loadVlmJobs();
 window.setInterval(loadVlmJobs, 5000);

@@ -4,3 +4,4 @@ __pycache__/
 *.py[cod]
 app/__pycache__/
 data/cache/
+data/graphhopper/

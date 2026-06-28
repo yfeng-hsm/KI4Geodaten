@@ -39,6 +39,15 @@ def test_surface_normalization_groups_semantically_equivalent_values():
     assert normalize_vlm_surface("uncertain") is None
 
 
+def test_road_category_sql_prioritizes_psv_as_vehicle():
+    sql = OSMStore(None)._road_category_sql("r")
+
+    assert "r.tags->>'psv' IN ('yes', 'designated')" in sql
+    assert sql.find("'platform'") < sql.find("r.tags->>'psv'")
+    assert sql.find("r.tags->>'psv'") < sql.find("r.highway = 'cycleway'")
+    assert sql.find("r.tags->>'psv'") < sql.find("'path'")
+
+
 def test_grouped_surface_counts_and_majority_ignore_uncertain_values():
     counts = grouped_surface_counts({
         "unpaved": 2,

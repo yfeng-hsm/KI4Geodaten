@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>KI4Geodaten · Mainz Census 100m 格网</title>
     <link rel="stylesheet" href="/static/vendor/leaflet/leaflet.css">
-    <link rel="stylesheet" href="/static/styles.css?v=20260625-vlm-unusable-replacement">
+    <link rel="stylesheet" href="/static/styles.css?v=20260626-corrected-match">
   </head>
   <body>
     <header class="topbar">
@@ -15,6 +15,7 @@
       </div>
       <div class="service-status">
         <div class="health" id="mapillary-health">Mapillary 检查中…</div>
+        <div class="health warning" id="graphhopper-health">GraphHopper 检查中…</div>
         <label class="model-picker">
           <span id="model-health">模型检查中…</span>
           <select id="model-select" disabled>
@@ -84,6 +85,19 @@
             <button id="validate-road-surface-button" type="button">计算全域 road surface 一致性</button>
             <progress id="surface-validation-progress" hidden></progress>
             <p id="surface-validation-status" class="muted">计算后显示所有可匹配 road segment：绿色一致，红色不一致。</p>
+            <div class="map-match-panel">
+              <span>GraphHopper map matching</span>
+              <select id="map-matching-sequence-select" disabled>
+                <option value="">先加载 Mapillary 图像</option>
+              </select>
+              <button id="run-graphhopper-matching-button" type="button" disabled>运行当前 cell Mapillary 轨迹匹配</button>
+              <select id="map-matching-segment-select" disabled>
+                <option value="">先运行轨迹匹配</option>
+              </select>
+              <button id="confirm-current-mapmatching-button" type="button" disabled>确认保存当前匹配点</button>
+              <button id="process-current-trajectory-vlm-button" type="button" disabled>Process 已确认轨迹图片</button>
+              <p id="map-matching-status" class="muted">加载当前 cell 的 Mapillary 图像后，可以手动组织 sequence 并运行 GraphHopper。</p>
+            </div>
           </div>
 
           <div class="summary">
@@ -143,6 +157,6 @@
     </main>
 
     <script src="/static/vendor/leaflet/leaflet.js"></script>
-    <script src="/static/app.js?v=20260625-vlm-unusable-replacement"></script>
+    <script src="/static/app.js?v=20260626-corrected-match"></script>
   </body>
 </html>

@@ -33,12 +33,27 @@ services:
       OLLAMA_MAX_IMAGES_PER_REQUEST: ${OLLAMA_MAX_IMAGES_PER_REQUEST:-20}
       OLLAMA_IMAGE_THUMB_SIZE: ${OLLAMA_IMAGE_THUMB_SIZE:-512}
       OLLAMA_CONCURRENCY: ${OLLAMA_CONCURRENCY:-4}
+      GRAPHHOPPER_BASE_URL: ${GRAPHHOPPER_BASE_URL:-http://graphhopper:8989}
+      GRAPHHOPPER_TIMEOUT_SECONDS: ${GRAPHHOPPER_TIMEOUT_SECONDS:-30}
       MAPILLARY_ACCESS_TOKEN: ${MAPILLARY_ACCESS_TOKEN:-}
       MAPILLARY_CACHE_DIR: /app/data/cache
       MAPILLARY_CACHE_TTL_SECONDS: ${MAPILLARY_CACHE_TTL_SECONDS:-86400}
       MAPILLARY_MAX_IMAGES_PER_GRID: ${MAPILLARY_MAX_IMAGES_PER_GRID:-2000}
     volumes:
       - mapillary-cache:/app/data/cache
+      - ./data/graphhopper:/app/data/graphhopper
+
+  graphhopper:
+    build:
+      context: .
+      dockerfile: Dockerfile.graphhopper
+      args:
+        GRAPHHOPPER_REF: ${GRAPHHOPPER_REF:-master}
+    ports:
+      - "8989:8989"
+      - "8990:8990"
+    volumes:
+      - ./data/graphhopper:/data
 
 volumes:
   mapillary-cache:

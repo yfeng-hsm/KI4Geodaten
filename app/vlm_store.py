@@ -17,8 +17,12 @@ def preferred_mapillary_geometry(
 ) -> dict[str, Any] | None:
     properties = image_properties or {}
     return (
-        properties.get("computed_geometry")
+        properties.get("mapmatched_geometry")
+        or properties.get("mapmatching_geometry")
+        or properties.get("computed_geometry")
+        or properties.get("mapillary_geometry")
         or properties.get("original_geometry")
+        or properties.get("gps_geometry")
         or geometry
     )
 
@@ -204,13 +208,21 @@ class VLMAnalysisStore:
                 """
                 UPDATE vlm_image_analysis
                 SET geometry = COALESCE(
+                        image_properties->'mapmatched_geometry',
+                        image_properties->'mapmatching_geometry',
                         image_properties->'computed_geometry',
+                        image_properties->'mapillary_geometry',
                         image_properties->'original_geometry',
+                        image_properties->'gps_geometry',
                         geometry
                     )
                 WHERE geometry IS DISTINCT FROM COALESCE(
+                        image_properties->'mapmatched_geometry',
+                        image_properties->'mapmatching_geometry',
                         image_properties->'computed_geometry',
+                        image_properties->'mapillary_geometry',
                         image_properties->'original_geometry',
+                        image_properties->'gps_geometry',
                         geometry
                     )
                 """
@@ -423,10 +435,46 @@ class VLMAnalysisStore:
                 SELECT image_id
                 FROM vlm_image_analysis
                 WHERE image_id = ANY(%s)
+                    AND error IS NULL
                 """,
                 (image_ids,),
             ).fetchall()
         return {row["image_id"] for row in rows}
+
+    def update_image_metadata(
+        self,
+        grid_id: str,
+        image: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if not self.database_url:
+            return None
+        self.ensure_schema()
+        image_id = _image_id(image)
+        if not image_id:
+            return None
+        image_properties = image.get("properties") or {}
+        geometry = preferred_mapillary_geometry(image.get("geometry"), image_properties)
+        now = datetime.now(timezone.utc)
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                UPDATE vlm_image_analysis
+                SET grid_id = %s,
+                    geometry = COALESCE(%s::jsonb, geometry),
+                    image_properties = COALESCE(image_properties, '{}'::jsonb) || %s::jsonb,
+                    updated_at = %s
+                WHERE image_id = %s
+                RETURNING image_id, grid_id, model, prompt_version, geometry, image_properties, fields, error, updated_at
+                """,
+                (
+                    grid_id,
+                    json.dumps(geometry, ensure_ascii=False) if geometry else None,
+                    json.dumps(image_properties, ensure_ascii=False),
+                    now,
+                    image_id,
+                ),
+            ).fetchone()
+        return self._format_row(row) if row else None
 
     def upsert(self, grid_id: str, result: dict[str, Any]) -> dict[str, Any]:
         if not self.database_url:

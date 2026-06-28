@@ -1,0 +1,45 @@
+graphhopper:
+  datareader.file: /data/mainz.osm.xml
+  graph.location: /data/graph-cache
+  graph.dataaccess.default_type: RAM_STORE
+  import.osm.ignored_highways: ''
+  prepare.min_network_size: 20
+  prepare.subnetworks.threads: 1
+  routing.non_ch.max_waypoint_distance: 1000000
+
+  profiles:
+    - name: car
+      custom_model_files: [car.json]
+    - name: bike
+      custom_model_files: [bike.json]
+    - name: foot
+      custom_model_files: [foot.json]
+
+  profiles_ch:
+    - profile: car
+
+  profiles_lm: []
+
+  graph.encoded_values: |
+    car_access, car_average_speed, country, road_class, roundabout, max_speed, road_environment,
+    foot_access, foot_average_speed, foot_priority, foot_road_access, hike_rating,
+    bike_access, bike_average_speed, bike_priority, bike_road_access, bike_network, mtb_rating,
+    ferry_speed
+
+server:
+  application_connectors:
+    - type: http
+      port: 8989
+      bind_host: 0.0.0.0
+  admin_connectors:
+    - type: http
+      port: 8990
+      bind_host: 0.0.0.0
+  request_log:
+    appenders: []
+
+logging:
+  appenders:
+    - type: console
+      time_zone: UTC
+      log_format: "%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n"

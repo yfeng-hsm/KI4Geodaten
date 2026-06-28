@@ -14,7 +14,7 @@ from app.grid import CensusGridCell
 
 
 MAPILLARY_IMAGES_URL = "https://graph.mapillary.com/images"
-MAPILLARY_CACHE_SCHEMA_VERSION = 3
+MAPILLARY_CACHE_SCHEMA_VERSION = 4
 IMAGE_FIELDS = ",".join(
     [
         "id",
@@ -134,16 +134,68 @@ class MapillaryClient:
         if not self.settings.cache_dir.exists():
             return {}
         index = {}
-        for path in self.settings.cache_dir.glob("*.geojson"):
-            try:
-                collection = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                continue
+        for collection in self._cached_collections():
             for feature in collection.get("features", []):
                 image_id = str(feature.get("id") or feature.get("properties", {}).get("id") or "")
                 if image_id:
                     index[image_id] = feature
         return index
+
+    def cached_images_for_sequence(self, sequence_id: str) -> dict:
+        features_by_id: dict[str, dict[str, Any]] = {}
+        grid_ids: set[str] = set()
+        for collection in self._cached_collections():
+            grid_id = collection.get("meta", {}).get("grid_id")
+            for feature in collection.get("features", []):
+                properties = feature.get("properties", {})
+                if str(properties.get("sequence_id") or "") != sequence_id:
+                    continue
+                image_id = str(feature.get("id") or properties.get("id") or "")
+                if not image_id:
+                    continue
+                features_by_id[image_id] = feature
+                if grid_id:
+                    grid_ids.add(str(grid_id))
+        features = sorted(
+            features_by_id.values(),
+            key=lambda item: (
+                item.get("properties", {}).get("captured_at") or 0,
+                str(item.get("id") or item.get("properties", {}).get("id") or ""),
+            ),
+        )
+        return {
+            "type": "FeatureCollection",
+            "features": features,
+            "meta": {
+                "sequence_id": sequence_id,
+                "count": len(features),
+                "grid_count": len(grid_ids),
+                "cache": "sequence-scan",
+            },
+        }
+
+    def cached_images_for_cell(self, cell: CensusGridCell) -> dict | None:
+        path = self._cache_path(cell)
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def _cached_collections(self) -> list[dict]:
+        if not self.settings.cache_dir.exists():
+            return []
+        collections = []
+        for path in self.settings.cache_dir.glob("*.geojson"):
+            try:
+                collection = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if collection.get("meta", {}).get("mapillary_cache_schema_version") != MAPILLARY_CACHE_SCHEMA_VERSION:
+                continue
+            collections.append(collection)
+        return collections
 
 
 def _normalize_image(raw: dict) -> dict:
@@ -157,6 +209,9 @@ def _normalize_image(raw: dict) -> dict:
     sequence = properties.get("sequence")
     if isinstance(sequence, dict):
         properties["sequence_id"] = sequence.get("id")
+        del properties["sequence"]
+    elif sequence:
+        properties["sequence_id"] = str(sequence)
         del properties["sequence"]
     properties["mapillary_url"] = f"https://www.mapillary.com/app/?pKey={raw['id']}"
     return {

@@ -70,6 +70,28 @@ docker compose exec app python scripts/import_osm_mainz.py
 
 Overpass 原始响应缓存到 Docker 卷中的 `/app/data/cache/osm_mainz_overpass.json`；需要重新下载时加 `--refresh`。
 
+## GraphHopper Map Matching
+
+Map matching 使用 GraphHopper `/match`，输入为同一个 Mapillary `sequence_id` 内的原始 GPS 点。应用不会再把一个 cell 内不同 sequence 的图片按时间随机拼成轨迹；如果缓存里没有真实 `sequence_id`，map matching 图层会提示需要重新确认访问 Mapillary 来刷新元数据。
+
+在 `.env` 中配置 GraphHopper 服务地址：
+
+```bash
+GRAPHHOPPER_BASE_URL=http://graphhopper:8989
+GRAPHHOPPER_TIMEOUT_SECONDS=30
+```
+
+GraphHopper 服务由 `Dockerfile.graphhopper` 从官方源码构建。首次使用前先把已经导入 PostGIS 的 Mainz 路网导出为 GraphHopper 可导入的 OSM XML：
+
+```bash
+docker compose exec app python scripts/export_graphhopper_osm.py
+docker compose up -d --build graphhopper app
+```
+
+GraphHopper 会从 `data/graphhopper/mainz.osm.xml` 导入图，并启用 `car`、`bike`、`foot` profiles。后端会根据该 sequence 内 VLM 的 `capture_position` 多数值选择 profile：车行观测使用 `car`，自行车观测使用 `bike`，行人观测使用 `foot`。如果还没有 VLM 结果，默认使用 `car`。
+
+前端 `Map matched raw GPS` 图层中，橙色虚线是真实 Mapillary sequence 原始 GPS 轨迹，蓝色线是 GraphHopper 匹配后的轨迹；点击点可查看原图、原始 GPS 坐标和 GraphHopper snapped 坐标。
+
 ## Ollama VLM
 
 应用通过 `OLLAMA_BASE_URL` 连接远程 Ollama。默认 compose 配置使用：

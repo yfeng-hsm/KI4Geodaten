@@ -1,0 +1,16 @@
+FROM maven:3.9-eclipse-temurin-25 AS build
+
+ARG GRAPHHOPPER_REF=master
+WORKDIR /src
+RUN git clone --depth 1 --branch "${GRAPHHOPPER_REF}" https://github.com/graphhopper/graphhopper.git .
+RUN mvn -DskipTests package
+
+FROM eclipse-temurin:25-jre
+
+WORKDIR /graphhopper
+COPY --from=build /src/web/target/graphhopper-web-*.jar /graphhopper/graphhopper-web.jar
+COPY --from=build /src/core/src/main/resources/com/graphhopper/custom_models /graphhopper/custom_models
+COPY graphhopper/config.yml /graphhopper/config.yml
+
+EXPOSE 8989 8990
+CMD ["java", "-Xmx3g", "-jar", "/graphhopper/graphhopper-web.jar", "server", "/graphhopper/config.yml"]

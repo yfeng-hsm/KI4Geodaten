@@ -70,9 +70,11 @@ docker compose exec app python scripts/import_osm_mainz.py
 
 Overpass 原始响应缓存到 Docker 卷中的 `/app/data/cache/osm_mainz_overpass.json`；需要重新下载时加 `--refresh`。
 
-## GraphHopper Map Matching
+## Map Matching
 
-Map matching 使用 GraphHopper `/match`，输入为同一个 Mapillary `sequence_id` 内的原始 GPS 点。应用不会再把一个 cell 内不同 sequence 的图片按时间随机拼成轨迹；如果缓存里没有真实 `sequence_id`，map matching 图层会提示需要重新确认访问 Mapillary 来刷新元数据。
+Map matching 输入为同一个 Mapillary `sequence_id` 内的原始 GPS 点。应用不会再把一个 cell 内不同 sequence 的图片按时间随机拼成轨迹；如果缓存里没有真实 `sequence_id`，map matching 图层会提示需要重新确认访问 Mapillary 来刷新元数据。
+
+前端右侧 `Map matching` 面板可以在 `GraphHopper` 和 `Valhalla` 之间切换。GraphHopper 使用 `/match`；Valhalla 使用 `/trace_route`。二者共用同一套轨迹选择、直接 matching、按 `capture_position` matching、子轨迹确认保存流程。
 
 在 `.env` 中配置 GraphHopper 服务地址：
 
@@ -88,9 +90,29 @@ docker compose exec app python scripts/export_graphhopper_osm.py
 docker compose up -d --build graphhopper app
 ```
 
-GraphHopper 会从 `data/graphhopper/mainz.osm.xml` 导入图，并启用 `car`、`bike`、`foot` profiles。后端会根据该 sequence 内 VLM 的 `capture_position` 多数值选择 profile：车行观测使用 `car`，自行车观测使用 `bike`，行人观测使用 `foot`。如果还没有 VLM 结果，默认使用 `car`。
+GraphHopper 会从 `data/graphhopper/mainz.osm.xml` 导入图，并启用 `car`、`bike`、`foot` profiles。后端会根据该 sequence 内 VLM 的 `capture_position` 多数值选择 profile：车行观测只使用 `car`；行人观测只使用 `foot`，不受机动车单行道约束；自行车观测会优先 `bike`，必要时允许 `foot`/`car` 参与几何竞争。直接 matching 不使用视觉类型时会比较 `foot`、`bike`、`car`。
 
-前端 `Map matched raw GPS` 图层中，橙色虚线是真实 Mapillary sequence 原始 GPS 轨迹，蓝色线是 GraphHopper 匹配后的轨迹；点击点可查看原图、原始 GPS 坐标和 GraphHopper snapped 坐标。
+Valhalla 作为可选 compose service 提供。默认使用 Rheinland-Pfalz 的 Geofabrik PBF，覆盖 Mainz；第一次启动会下载 PBF 并在 `data/valhalla/` 构建 tiles，可能需要较长时间。
+
+```bash
+VALHALLA_BASE_URL=http://valhalla:8002
+VALHALLA_TIMEOUT_SECONDS=30
+VALHALLA_TILE_URLS=https://download.geofabrik.de/europe/germany/rheinland-pfalz-latest.osm.pbf
+```
+
+启动 Valhalla 和 app：
+
+```bash
+docker compose up -d valhalla app
+```
+
+如果 tiles 已经构建好，后续启动会复用 `data/valhalla/`。需要强制重新构建时设置：
+
+```bash
+VALHALLA_FORCE_REBUILD=True docker compose up -d valhalla
+```
+
+前端 `Raw/corrected matched trajectories` 图层中，橙色虚线是真实 Mapillary sequence 原始 GPS 轨迹，蓝色线是当前 provider 匹配后的轨迹；点击点可查看原图、原始 GPS 坐标和 map-matched 坐标。
 
 ## Ollama VLM
 

@@ -5,3 +5,5 @@ __pycache__/
 app/__pycache__/
 data/cache/
 data/graphhopper/
+data/valhalla/*
+!data/valhalla/.gitkeep

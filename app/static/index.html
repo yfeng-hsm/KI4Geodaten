@@ -15,7 +15,14 @@
       </div>
       <div class="service-status">
         <div class="health" id="mapillary-health">Mapillary 检查中…</div>
-        <div class="health warning" id="graphhopper-health">GraphHopper 检查中…</div>
+        <div class="health warning" id="graphhopper-health">Map matching 检查中…</div>
+        <label class="model-picker">
+          <span>匹配服务</span>
+          <select id="map-matching-provider-select">
+            <option value="valhalla" selected>Valhalla</option>
+            <option value="graphhopper">GraphHopper</option>
+          </select>
+        </label>
         <label class="model-picker">
           <span id="model-health">模型检查中…</span>
           <select id="model-select" disabled>
@@ -86,18 +93,18 @@
             <progress id="surface-validation-progress" hidden></progress>
             <p id="surface-validation-status" class="muted">计算后显示所有可匹配 road segment：绿色一致，红色不一致。</p>
             <div class="map-match-panel">
-              <span>GraphHopper map matching</span>
+              <span>Map matching</span>
               <select id="map-matching-sequence-select" disabled>
                 <option value="">先加载 Mapillary 图像</option>
               </select>
               <button id="run-graphhopper-direct-button" type="button" disabled>直接 map matching</button>
+              <button id="process-current-trajectory-vlm-button" type="button" disabled>Process 当前轨迹图片</button>
               <button id="run-graphhopper-matching-button" type="button" disabled>按 capture_position map matching</button>
               <select id="map-matching-segment-select" disabled>
                 <option value="">先运行轨迹匹配</option>
               </select>
               <button id="confirm-current-mapmatching-button" type="button" disabled>确认保存当前匹配点</button>
-              <button id="process-current-trajectory-vlm-button" type="button" disabled>Process 当前子轨迹图片</button>
-              <p id="map-matching-status" class="muted">加载当前 cell 的 Mapillary 图像后，可以手动组织 sequence 并运行 GraphHopper。</p>
+              <p id="map-matching-status" class="muted">加载当前 cell 的 Mapillary 图像后，可以选择 provider、选择 sequence 并运行 map matching。</p>
             </div>
           </div>
 
@@ -158,6 +165,6 @@
     </main>
 
     <script src="/static/vendor/leaflet/leaflet.js"></script>
-    <script src="/static/app.js?v=20260626-corrected-match"></script>
+    <script src="/static/app.js?v=20260629-provider-topbar"></script>
   </body>
 </html>

@@ -23,6 +23,7 @@ from app.mapillary import (
 from app.mapillary_positions import MapillaryPositionStore
 from app.ollama import OllamaClient, OllamaConfigurationError
 from app.osm import OSMStore
+from app.valhalla import ValhallaClient
 from app.vlm_store import VLMAnalysisStore
 
 
@@ -37,6 +38,7 @@ async def lifespan(app: FastAPI):
     app.state.mapillary = MapillaryClient(settings)
     app.state.mapillary_positions = MapillaryPositionStore(settings.database_url)
     app.state.graphhopper = GraphHopperClient(settings)
+    app.state.valhalla = ValhallaClient(settings)
     app.state.census = CensusStore(Path(__file__).parent / "data" / "census")
     app.state.osm = OSMStore(settings.database_url)
     app.state.ollama = OllamaClient(settings)
@@ -78,6 +80,7 @@ async def health(request: Request) -> dict:
         "mapillary_configured": bool(settings.mapillary_access_token),
         "ollama": await request.app.state.ollama.status(),
         "graphhopper": await request.app.state.graphhopper.status(),
+        "valhalla": await request.app.state.valhalla.status(),
         "grid_crs": "EPSG:3035",
         "grid_resolution_m": 100,
         "census_city": request.app.state.census.meta["city"],
@@ -228,6 +231,7 @@ async def map_matching_for_grid(
     request: Request,
     limit: int = Query(default=500, ge=2, le=1000),
     sequence_id: str | None = Query(default=None),
+    provider: str = Query(default="graphhopper", pattern="^(graphhopper|valhalla)$"),
     max_gap_m: float = Query(default=40.0, ge=5.0, le=500.0),
     sequence_expand_radius: int = Query(default=1, ge=0, le=3),
     use_visual_user_type: bool = Query(default=True),
@@ -278,7 +282,8 @@ async def map_matching_for_grid(
             "meta": {
                 "count": len(cell_observations),
                 "matched": 0,
-                "method": "graphhopper_sequence_map_matching",
+                "method": f"{provider}_sequence_map_matching",
+                "provider": provider,
             },
         }
     filtered_sequence, stop_cluster_count, stop_point_count = _drop_stop_clusters(selected_sequence)
@@ -288,11 +293,13 @@ async def map_matching_for_grid(
         stop_cluster_count = 0
         stop_point_count = 0
     segments = _split_map_matching_segments(selected_sequence, max_gap_m=max_gap_m)
-    result = await _graphhopper_map_matching_segment_layers(
+    matcher = request.app.state.valhalla if provider == "valhalla" else request.app.state.graphhopper
+    result = await _provider_map_matching_segment_layers(
         segments,
-        request.app.state.graphhopper,
+        matcher,
         request.app.state.osm,
         sequence_id=str(selected_sequence[0].get("sequence_id") or "unknown"),
+        provider=provider,
         max_gap_m=max_gap_m,
         use_visual_user_type=use_visual_user_type,
         gps_accuracy_m=gps_accuracy_m,
@@ -308,6 +315,7 @@ async def map_matching_for_grid(
         result["meta"]["sequence_cache_expand"] = sequence_cache_meta
     result["meta"]["use_visual_user_type"] = use_visual_user_type
     result["meta"]["gps_accuracy_m"] = gps_accuracy_m
+    result["meta"]["provider"] = provider
     return result
 
 
@@ -777,12 +785,13 @@ def _reindex_map_matching_observations(observations: list[dict]) -> list[dict]:
     return rows
 
 
-async def _graphhopper_map_matching_segment_layers(
+async def _provider_map_matching_segment_layers(
     segments: list[list[dict]],
-    graphhopper: GraphHopperClient,
+    matcher,
     osm_store: OSMStore,
     *,
     sequence_id: str,
+    provider: str,
     max_gap_m: float,
     use_visual_user_type: bool,
     gps_accuracy_m: float,
@@ -823,6 +832,7 @@ async def _graphhopper_map_matching_segment_layers(
             segment_result = _raw_map_matching_segment_layers(
                 segment,
                 segment_index=segment_index,
+                provider=provider,
                 user_type=user_type,
                 user_type_votes=user_type_votes,
                 user_type_status=user_type_status,
@@ -853,16 +863,18 @@ async def _graphhopper_map_matching_segment_layers(
             if use_visual_user_type
             else ("foot", "bike", "car")
         )
-        profile, graphhopper_result = await _best_graphhopper_result(
+        profile, matching_result = await _best_provider_result(
             segment,
-            graphhopper,
+            matcher,
+            provider=provider,
             profiles=candidate_profiles,
             gps_accuracy_m=gps_accuracy_m,
         )
-        segment_result = _graphhopper_map_matching_layers(
+        segment_result = _provider_map_matching_layers(
             segment,
-            graphhopper_result,
+            matching_result,
             profile=profile,
+            provider=provider,
             osm_store=osm_store,
             segment_index=segment_index,
             max_gap_m=max_gap_m,
@@ -919,7 +931,8 @@ async def _graphhopper_map_matching_segment_layers(
             "max_gap_m": max_gap_m,
             "use_visual_user_type": use_visual_user_type,
             "gps_accuracy_m": gps_accuracy_m,
-            "method": "graphhopper_sequence_map_matching",
+            "method": f"{provider}_sequence_map_matching",
+            "provider": provider,
         },
     }
 
@@ -945,7 +958,7 @@ def _trajectory_user_type_status(
     user_type: str,
     votes: dict[str, int],
     *,
-    min_coverage_ratio: float = 0.4,
+    min_coverage_ratio: float = 0.35,
     min_winner_ratio: float = 0.6,
     min_votes: int = 3,
 ) -> dict:
@@ -986,7 +999,7 @@ def _candidate_graphhopper_profiles(user_type: str) -> tuple[str, ...]:
     if user_type == "bike":
         return ("bike", "foot", "car")
     if user_type == "foot":
-        return ("foot", "bike", "car")
+        return ("foot",)
     return ("foot", "bike", "car")
 
 
@@ -994,6 +1007,7 @@ def _raw_map_matching_segment_layers(
     observations: list[dict],
     *,
     segment_index: int,
+    provider: str = "graphhopper",
     user_type: str,
     user_type_votes: dict[str, int],
     user_type_status: dict,
@@ -1052,25 +1066,28 @@ def _raw_map_matching_segment_layers(
             "user_type_votes": user_type_votes,
             "user_type_status": user_type_status,
             "candidate_profiles": [],
-            "method": "graphhopper_sequence_map_matching",
+            "method": f"{provider}_sequence_map_matching",
+            "provider": provider,
         },
     }
 
 
-async def _best_graphhopper_result(
+async def _best_provider_result(
     observations: list[dict],
-    graphhopper: GraphHopperClient,
+    matcher,
     *,
+    provider: str,
     profiles: tuple[str, ...] = ("foot", "bike", "car"),
     gps_accuracy_m: float = 6.0,
 ) -> tuple[str, dict]:
     candidates: list[tuple[float, int, str, dict]] = []
     failures: list[str] = []
     for profile_index, profile in enumerate(profiles):
-        result = await graphhopper.match_trace(observations, profile=profile, gps_accuracy=gps_accuracy_m)
+        result = await matcher.match_trace(observations, profile=profile, gps_accuracy=gps_accuracy_m)
         if not result.get("available"):
             failures.append(f"{profile}: {result.get('reason', 'unavailable')}")
             continue
+        result["provider"] = provider
         score = _distance_score_to_matched_geometry(observations, result.get("geometry") or {})
         candidates.append((score, profile_index, profile, result))
     if candidates:
@@ -1088,7 +1105,7 @@ async def _best_graphhopper_result(
         selected_result["profile_score"] = round(selected_score, 3)
         selected_result["candidate_profiles"] = list(profiles)
         return selected_profile, selected_result
-    return "auto", {"available": False, "reason": "; ".join(failures[:3]) or "No GraphHopper profile matched"}
+    return "auto", {"available": False, "reason": "; ".join(failures[:3]) or f"No {provider} profile matched"}
 
 
 def _distance_score_to_matched_geometry(observations: list[dict], geometry: dict) -> float:
@@ -1109,11 +1126,12 @@ def _distance_score_to_matched_geometry(observations: list[dict], geometry: dict
     return mean_distance + 0.5 * p90_distance + 0.1 * max_distance
 
 
-def _graphhopper_map_matching_layers(
+def _provider_map_matching_layers(
     observations: list[dict],
-    graphhopper_result: dict,
+    matching_result: dict,
     *,
     profile: str,
+    provider: str,
     osm_store: OSMStore | None = None,
     segment_index: int = 0,
     max_gap_m: float = 40.0,
@@ -1143,10 +1161,10 @@ def _graphhopper_map_matching_layers(
             "use_visual_user_type": use_visual_user_type,
         }
     )
-    if not graphhopper_result.get("available"):
+    if not matching_result.get("available"):
         return {
             "available": False,
-            "reason": graphhopper_result.get("reason", "GraphHopper map matching unavailable"),
+            "reason": matching_result.get("reason", f"{provider} map matching unavailable"),
             "layers": {
                 "points": {"type": "FeatureCollection", "features": raw_points},
                 "links": {"type": "FeatureCollection", "features": []},
@@ -1164,20 +1182,21 @@ def _graphhopper_map_matching_layers(
                 "user_type_status": user_type_status or {},
                 "candidate_profiles": list(candidate_profiles),
                 "use_visual_user_type": use_visual_user_type,
-                "method": "graphhopper_sequence_map_matching",
+                "method": f"{provider}_sequence_map_matching",
+                "provider": provider,
             },
         }
 
-    selected_matched_geometry = graphhopper_result["geometry"]
-    snapped_waypoints = _snapped_waypoint_coordinates(graphhopper_result)
+    selected_matched_geometry = matching_result["geometry"]
+    snapped_waypoints = _snapped_waypoint_coordinates(matching_result)
     blue_line_waypoints = _nearest_points_on_linestring(observations, selected_matched_geometry)
     if not snapped_waypoints:
         snapped_waypoints = blue_line_waypoints
     projection_profiles: list[str | None] = []
     matched_geometry = selected_matched_geometry
-    matched_kind = "graphhopper_matched"
+    matched_kind = f"{provider}_matched"
     display_profile = profile
-    profile_geometries = graphhopper_result.get("profile_geometries")
+    profile_geometries = matching_result.get("profile_geometries")
     if use_visual_user_type and isinstance(profile_geometries, dict) and len(profile_geometries) > 1:
         mixed_waypoints, projection_profiles = _nearest_points_on_profile_linestrings(
             observations,
@@ -1193,21 +1212,21 @@ def _graphhopper_map_matching_layers(
     road_features_by_id: dict[str, dict] = {}
     local_override_count = 0
     for index, observation in enumerate(observations):
-        graphhopper_snapped = snapped_waypoints[index] if index < len(snapped_waypoints) else None
-        blue_line_snapped = blue_line_waypoints[index] if index < len(blue_line_waypoints) else graphhopper_snapped
+        provider_snapped = snapped_waypoints[index] if index < len(snapped_waypoints) else None
+        blue_line_snapped = blue_line_waypoints[index] if index < len(blue_line_waypoints) else provider_snapped
         mapmatched_geometry = (
             {"type": "Point", "coordinates": blue_line_snapped}
             if blue_line_snapped
             else None
         )
-        graphhopper_distance = (
+        provider_distance = (
             _haversine_m(
                 float(observation["lon"]),
                 float(observation["lat"]),
-                float(graphhopper_snapped[0]),
-                float(graphhopper_snapped[1]),
+                float(provider_snapped[0]),
+                float(provider_snapped[1]),
             )
-            if graphhopper_snapped
+            if provider_snapped
             else None
         )
         snapped = blue_line_snapped
@@ -1222,7 +1241,8 @@ def _graphhopper_map_matching_layers(
             else None
         )
         snap_properties = {
-            "snap_source": "graphhopper_matched_trajectory_projection",
+            "snap_source": f"{provider}_matched_trajectory_projection",
+            "mapmatching_provider": provider,
             "distance_m": round(snapped_distance, 2) if snapped_distance is not None else None,
             "local_osm_id": None,
             "local_highway": None,
@@ -1230,16 +1250,16 @@ def _graphhopper_map_matching_layers(
             "local_road_category": None,
             "local_distance_m": None,
         }
-        snap_properties["graphhopper_distance_m"] = (
-            round(graphhopper_distance, 2) if graphhopper_distance is not None else None
-        )
+        snap_properties["provider_distance_m"] = round(provider_distance, 2) if provider_distance is not None else None
+        if provider == "graphhopper":
+            snap_properties["graphhopper_distance_m"] = snap_properties["provider_distance_m"]
         snap_properties["gps_geometry"] = observation.get("gps_geometry") or {
             "type": "Point",
             "coordinates": [observation["lon"], observation["lat"]],
         }
         snap_properties["mapillary_geometry"] = observation.get("mapillary_geometry")
         snap_properties["mapmatched_geometry"] = mapmatched_geometry
-        snap_properties["mapmatched_source"] = "graphhopper_matched_trajectory_projection"
+        snap_properties["mapmatched_source"] = f"{provider}_matched_trajectory_projection"
         snap_properties["profile"] = display_profile
         snap_properties["base_profile"] = profile
         snap_properties["projection_profile"] = (
@@ -1291,11 +1311,12 @@ def _graphhopper_map_matching_layers(
                 "features": [
                     {
                         "type": "Feature",
-                        "id": f"graphhopper-matched-trajectory/{segment_index}",
+                        "id": f"{provider}-matched-trajectory/{segment_index}",
                         "geometry": matched_geometry,
                         "properties": {
-                            "kind": "graphhopper_matched",
+                            "kind": f"{provider}_matched",
                             "match_kind": matched_kind,
+                            "provider": provider,
                             "sequence_id": sequence_id,
                             "segment_index": segment_index,
                             "profile": display_profile,
@@ -1305,11 +1326,11 @@ def _graphhopper_map_matching_layers(
                             "user_type_status": user_type_status or {},
                             "candidate_profiles": list(candidate_profiles),
                             "use_visual_user_type": use_visual_user_type,
-                            "distance": graphhopper_result.get("distance"),
-                            "time": graphhopper_result.get("time"),
+                            "distance": matching_result.get("distance"),
+                            "time": matching_result.get("time"),
                             "local_override_count": local_override_count,
-                            "profile_score": graphhopper_result.get("profile_score"),
-                            "profile_scores": graphhopper_result.get("profile_scores"),
+                            "profile_score": matching_result.get("profile_score"),
+                            "profile_scores": matching_result.get("profile_scores"),
                         },
                     }
                 ],
@@ -1322,17 +1343,18 @@ def _graphhopper_map_matching_layers(
             "profile": display_profile,
             "base_profile": profile,
             "match_kind": matched_kind,
+            "provider": provider,
             "user_type": user_type,
             "user_type_votes": user_type_votes or {},
             "user_type_status": user_type_status or {},
             "candidate_profiles": list(candidate_profiles),
             "use_visual_user_type": use_visual_user_type,
-            "distance": graphhopper_result.get("distance"),
-            "time": graphhopper_result.get("time"),
+            "distance": matching_result.get("distance"),
+            "time": matching_result.get("time"),
             "local_override_count": local_override_count,
-            "profile_score": graphhopper_result.get("profile_score"),
-            "profile_scores": graphhopper_result.get("profile_scores"),
-            "method": "graphhopper_sequence_map_matching",
+            "profile_score": matching_result.get("profile_score"),
+            "profile_scores": matching_result.get("profile_scores"),
+            "method": f"{provider}_sequence_map_matching",
         },
     }
 

@@ -35,6 +35,8 @@ services:
       OLLAMA_CONCURRENCY: ${OLLAMA_CONCURRENCY:-4}
       GRAPHHOPPER_BASE_URL: ${GRAPHHOPPER_BASE_URL:-http://graphhopper:8989}
       GRAPHHOPPER_TIMEOUT_SECONDS: ${GRAPHHOPPER_TIMEOUT_SECONDS:-30}
+      VALHALLA_BASE_URL: ${VALHALLA_BASE_URL:-http://valhalla:8002}
+      VALHALLA_TIMEOUT_SECONDS: ${VALHALLA_TIMEOUT_SECONDS:-30}
       MAPILLARY_ACCESS_TOKEN: ${MAPILLARY_ACCESS_TOKEN:-}
       MAPILLARY_CACHE_DIR: /app/data/cache
       MAPILLARY_CACHE_TTL_SECONDS: ${MAPILLARY_CACHE_TTL_SECONDS:-86400}
@@ -54,6 +56,23 @@ services:
       - "8990:8990"
     volumes:
       - ./data/graphhopper:/data
+
+  valhalla:
+    image: ghcr.io/gis-ops/docker-valhalla/valhalla:latest
+    ports:
+      - "8002:8002"
+    environment:
+      tile_urls: ${VALHALLA_TILE_URLS:-https://download.geofabrik.de/europe/germany/rheinland-pfalz-latest.osm.pbf}
+      server_threads: ${VALHALLA_SERVER_THREADS:-4}
+      use_tiles_ignore_pbf: ${VALHALLA_USE_TILES_IGNORE_PBF:-False}
+      force_rebuild: ${VALHALLA_FORCE_REBUILD:-False}
+      build_elevation: ${VALHALLA_BUILD_ELEVATION:-False}
+      build_admins: ${VALHALLA_BUILD_ADMINS:-False}
+      build_time_zones: ${VALHALLA_BUILD_TIME_ZONES:-False}
+      build_transit: ${VALHALLA_BUILD_TRANSIT:-False}
+      build_tar: ${VALHALLA_BUILD_TAR:-True}
+    volumes:
+      - ./data/valhalla:/custom_files
 
 volumes:
   mapillary-cache:

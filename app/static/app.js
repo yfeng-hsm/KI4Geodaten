@@ -76,6 +76,8 @@ let vlmJobTimer = null;
 let ollamaReady = false;
 let selectedModel = "";
 let selectedVlmTheme = "capture_position";
+let selectedMapMatchingProvider = "valhalla";
+let latestHealth = null;
 let surfaceValidationRunning = false;
 let mapMatchingRunning = false;
 
@@ -130,6 +132,7 @@ const VLM_RENDER_FEATURE_LIMIT = 1200;
 const VLM_RENDER_VIRTUAL_MIN_ZOOM = 17;
 const SELECTED_GRID_NEIGHBORHOOD_RADIUS = 1;
 const OSM_LAYER_RADIUS = 0;
+const MAP_MATCHING_CAPTURE_POSITION_MIN_COVERAGE = 0.35;
 
 function censusGridStyle(feature) {
   const population = feature.properties.population;
@@ -491,6 +494,7 @@ const deleteCellVlmButton = document.getElementById("delete-cell-vlm-button");
 const validateRoadSurfaceButton = document.getElementById("validate-road-surface-button");
 const surfaceValidationProgress = document.getElementById("surface-validation-progress");
 const surfaceValidationStatus = document.getElementById("surface-validation-status");
+const mapMatchingProviderSelect = document.getElementById("map-matching-provider-select");
 const mapMatchingSequenceSelect = document.getElementById("map-matching-sequence-select");
 const runGraphhopperDirectButton = document.getElementById("run-graphhopper-direct-button");
 const runGraphhopperMatchingButton = document.getElementById("run-graphhopper-matching-button");
@@ -504,6 +508,9 @@ const forceVlmCheckbox = document.getElementById("force-vlm-checkbox");
 const vlmThemeSelect = document.getElementById("vlm-theme-select");
 const refreshJobsButton = document.getElementById("refresh-vlm-jobs-button");
 const vlmJobsElement = document.getElementById("vlm-jobs");
+if (mapMatchingProviderSelect) {
+  selectedMapMatchingProvider = mapMatchingProviderSelect.value === "graphhopper" ? "graphhopper" : "valhalla";
+}
 const censusPopulationElement = document.getElementById("census-population");
 const censusAverageAgeElement = document.getElementById("census-average-age");
 const censusForeignersElement = document.getElementById("census-foreigners");
@@ -566,19 +573,21 @@ async function apiDelete(url) {
 async function checkHealth() {
   try {
     const health = await apiGet("/api/health");
+    latestHealth = health;
+    preferAvailableMapMatchingProvider();
     const ollama = health.ollama || {};
     ollamaReady = Boolean(ollama.connected && ollama.model_available !== false);
     mapillaryHealthElement.textContent = health.mapillary_configured
       ? "Mapillary 已配置"
       : "Mapillary 未配置";
     mapillaryHealthElement.classList.toggle("warning", !health.mapillary_configured);
-    updateGraphHopperHealth(health.graphhopper || {});
+    updateMapMatchingProviderHealth();
     updateModelPicker(ollama);
     updateProcessButtonState();
   } catch (_error) {
     mapillaryHealthElement.textContent = "Mapillary 状态未知";
     mapillaryHealthElement.classList.add("warning");
-    graphhopperHealthElement.textContent = "GraphHopper 状态未知";
+    graphhopperHealthElement.textContent = "Map matching 状态未知";
     graphhopperHealthElement.classList.add("warning");
     modelHealthElement.textContent = "模型状态未知";
     modelHealthElement.parentElement.classList.add("warning");
@@ -586,15 +595,31 @@ async function checkHealth() {
   }
 }
 
-function updateGraphHopperHealth(graphhopper) {
-  const configured = Boolean(graphhopper.configured);
-  const ok = Boolean(graphhopper.ok);
+function preferAvailableMapMatchingProvider() {
+  if (!mapMatchingProviderSelect || !latestHealth) return;
+  const valhallaOk = Boolean(latestHealth.valhalla?.ok);
+  const graphhopperOk = Boolean(latestHealth.graphhopper?.ok);
+  if (selectedMapMatchingProvider === "valhalla" && !valhallaOk && graphhopperOk) {
+    selectedMapMatchingProvider = "graphhopper";
+  }
+  mapMatchingProviderSelect.value = selectedMapMatchingProvider;
+}
+
+function selectedMapMatchingProviderLabel() {
+  return selectedMapMatchingProvider === "valhalla" ? "Valhalla" : "GraphHopper";
+}
+
+function updateMapMatchingProviderHealth() {
+  const providerHealth = latestHealth?.[selectedMapMatchingProvider] || {};
+  const configured = Boolean(providerHealth.configured);
+  const ok = Boolean(providerHealth.ok);
+  const label = selectedMapMatchingProviderLabel();
   if (!configured) {
-    graphhopperHealthElement.textContent = "GraphHopper 未配置";
+    graphhopperHealthElement.textContent = `${label} 未配置`;
   } else if (ok) {
-    graphhopperHealthElement.textContent = "GraphHopper 已连接";
+    graphhopperHealthElement.textContent = `${label} 已连接`;
   } else {
-    graphhopperHealthElement.textContent = "GraphHopper 连接失败";
+    graphhopperHealthElement.textContent = `${label} 连接失败`;
   }
   graphhopperHealthElement.classList.toggle("warning", !ok);
 }
@@ -825,16 +850,66 @@ function resetMapMatchingControls() {
   }
   if (mapMatchingStatusElement) {
     mapMatchingStatusElement.classList.remove("error");
-    mapMatchingStatusElement.textContent = "加载当前 cell 的 Mapillary 图像后，可以手动组织 sequence 并运行 GraphHopper。";
+    mapMatchingStatusElement.textContent = "加载当前 cell 的 Mapillary 图像后，可以选择 provider、选择 sequence 并运行 map matching。";
   }
   updateMapMatchingButtonState();
 }
 
+function mapMatchingSequenceGroups() {
+  const groups = new Map();
+  currentImageFeatures.forEach((feature) => {
+    const sequenceId = String(feature.properties?.sequence_id || "").trim();
+    if (!sequenceId) return;
+    const group = groups.get(sequenceId) || [];
+    group.push(feature);
+    groups.set(sequenceId, group);
+  });
+  return groups;
+}
+
+function selectedMapMatchingSequenceFeatures() {
+  const groups = mapMatchingSequenceGroups();
+  if (!groups.size) return [];
+  const selectedSequence = mapMatchingSequenceSelect?.value || "";
+  if (selectedSequence && groups.has(selectedSequence)) return groups.get(selectedSequence).slice();
+  const sorted = Array.from(groups.values()).sort((a, b) => b.length - a.length);
+  return (sorted[0] || []).slice();
+}
+
+function currentMapMatchingTrajectoryFeatures() {
+  const previewFeatures = currentMapMatchingLayers?.points?.features || [];
+  return previewFeatures.length ? previewFeatures.slice() : selectedMapMatchingSequenceFeatures();
+}
+
+function selectedSequenceCapturePositionReadiness(features) {
+  const total = features.length;
+  const validValues = new Set(["vehicle_road", "bicycle_road", "pedestrian_road"]);
+  const voted = features.reduce((count, feature) => {
+    const imageId = String(feature.properties?.image_id || feature.id || "");
+    const analysis = vlmResultsByImageId[imageId] || allVlmResultsByImageId[imageId] || null;
+    const capturePosition = analysis?.fields?.capture_position || feature.properties?.capture_position;
+    return count + (validValues.has(capturePosition) ? 1 : 0);
+  }, 0);
+  return {
+    ready: total > 1 && voted / total >= MAP_MATCHING_CAPTURE_POSITION_MIN_COVERAGE,
+    total,
+    voted,
+  };
+}
+
 function updateMapMatchingButtonState() {
-  const hasSequence = currentImageFeatures.some((feature) => String(feature.properties?.sequence_id || "").trim());
-  const runDisabled = mapMatchingRunning || !currentGrid || !hasSequence;
+  const trajectoryFeatures = currentMapMatchingTrajectoryFeatures();
+  const hasSequence = trajectoryFeatures.length > 1;
+  const visualReadiness = selectedSequenceCapturePositionReadiness(trajectoryFeatures);
+  const providerReady = Boolean(latestHealth?.[selectedMapMatchingProvider]?.ok);
+  const runDisabled = mapMatchingRunning || !currentGrid || !hasSequence || !providerReady;
   if (runGraphhopperDirectButton) runGraphhopperDirectButton.disabled = runDisabled;
-  if (runGraphhopperMatchingButton) runGraphhopperMatchingButton.disabled = runDisabled;
+  if (runGraphhopperMatchingButton) {
+    runGraphhopperMatchingButton.disabled = runDisabled || !visualReadiness.ready;
+    runGraphhopperMatchingButton.title = visualReadiness.ready
+      ? "当前轨迹已有足够 capture_position 结果，可以按视觉信息匹配。"
+      : `当前轨迹 capture_position 覆盖 ${visualReadiness.voted}/${visualReadiness.total}，需要至少 ${Math.ceil(visualReadiness.total * MAP_MATCHING_CAPTURE_POSITION_MIN_COVERAGE)} 个。`;
+  }
   const hasMapmatchedPreview = currentMapMatchingPointFeatures.some((feature) => (
     feature.properties?.mapmatched_geometry?.coordinates
   ));
@@ -846,14 +921,12 @@ function updateMapMatchingButtonState() {
     );
   }
   if (processCurrentTrajectoryVlmButton) {
-    const hasTrajectoryImages = currentMapMatchingPointFeatures.length > 0
-      || currentConfirmedMapMatchingPointFeatures.length > 0;
     processCurrentTrajectoryVlmButton.disabled = Boolean(
       mapMatchingRunning
       || !currentGrid
       || !ollamaReady
       || activeVlmJobId
-      || !hasTrajectoryImages
+      || !hasSequence
     );
   }
 }
@@ -867,9 +940,10 @@ function resetMapMatchingSegmentSelect() {
 function updateMapMatchingSegmentOptions() {
   if (!mapMatchingSegmentSelect) return;
   const selectedBefore = mapMatchingSegmentSelect.value;
-  const summaries = currentMapMatchingSegmentSummaries.length
+  const summaries = (currentMapMatchingSegmentSummaries.length
     ? currentMapMatchingSegmentSummaries
-    : summarizeMapMatchingSegments(currentMapMatchingLayers);
+    : summarizeMapMatchingSegments(currentMapMatchingLayers))
+    .filter((summary) => Number(summary.count || 0) > 1);
   currentMapMatchingSegmentSummaries = summaries;
   mapMatchingSegmentSelect.innerHTML = "";
   if (!summaries.length) {
@@ -960,6 +1034,16 @@ function summarizeMapMatchingSegments(layers) {
 }
 
 function renderSelectedMapMatchingSegment() {
+  if (!currentMapMatchingSegmentSummaries.length || currentMapMatchingSelectedSegment == null) {
+    mapMatchRoadLayer.clearLayers();
+    mapMatchRawTrajectoryLayer.clearLayers();
+    mapMatchMatchedTrajectoryLayer.clearLayers();
+    mapMatchLinkLayer.clearLayers();
+    mapMatchPointLayer.clearLayers();
+    currentMapMatchingPointFeatures = [];
+    updateMapMatchingButtonState();
+    return;
+  }
   const segmentIndex = Number(currentMapMatchingSelectedSegment ?? 0);
   const layers = currentMapMatchingLayers || {};
   mapMatchRoadLayer.clearLayers();
@@ -990,14 +1074,7 @@ function filterFeaturesBySegment(collection, segmentIndex) {
 
 function updateMapMatchingSequenceOptions() {
   if (!mapMatchingSequenceSelect) return;
-  const groups = new Map();
-  currentImageFeatures.forEach((feature) => {
-    const sequenceId = String(feature.properties?.sequence_id || "").trim();
-    if (!sequenceId) return;
-    const group = groups.get(sequenceId) || [];
-    group.push(feature);
-    groups.set(sequenceId, group);
-  });
+  const groups = mapMatchingSequenceGroups();
 
   mapMatchingSequenceSelect.innerHTML = "";
   if (!groups.size) {
@@ -1027,7 +1104,8 @@ function updateMapMatchingSequenceOptions() {
   mapMatchingSequenceSelect.disabled = false;
   if (mapMatchingStatusElement) {
     mapMatchingStatusElement.classList.remove("error");
-    mapMatchingStatusElement.textContent = `当前 cell 有 ${sorted.length} 条 Mapillary sequence；点击按钮后才运行 GraphHopper。`;
+    const readiness = selectedSequenceCapturePositionReadiness(selectedMapMatchingSequenceFeatures());
+    mapMatchingStatusElement.textContent = `当前 cell 有 ${sorted.length} 条 Mapillary sequence；${selectedMapMatchingProviderLabel()} 直接 matching 可立即运行。按 capture_position matching 需要当前轨迹至少 35% 点已有结果：${readiness.voted}/${readiness.total}。`;
   }
   updateMapMatchingButtonState();
 }
@@ -1044,16 +1122,18 @@ async function runMapMatchingForCurrentGrid(useVisualUserType = true) {
     ? mapMatchingSequenceSelect.value
     : "";
   const sequenceParam = selectedSequence ? `&sequence_id=${encodeURIComponent(selectedSequence)}` : "";
+  const providerParam = `&provider=${encodeURIComponent(selectedMapMatchingProvider)}`;
   const visualParam = `&use_visual_user_type=${useVisualUserType ? "true" : "false"}`;
   const gpsAccuracyParam = "&gps_accuracy_m=6";
+  const providerLabel = selectedMapMatchingProviderLabel();
   if (mapMatchingStatusElement) {
     mapMatchingStatusElement.classList.remove("error");
     mapMatchingStatusElement.textContent = useVisualUserType
-      ? "正在按 capture_position 判断轨迹类型，并允许 foot/bike/car 按几何距离竞争…"
-      : "正在直接进行几何 map matching；本次不考虑视觉识别信息…";
+      ? `正在用 ${providerLabel} 按 capture_position 判断轨迹类型，并允许 foot/bike/car 按几何距离竞争…`
+      : `正在用 ${providerLabel} 直接进行几何 map matching；本次不考虑视觉识别信息…`;
   }
   try {
-    const result = await apiGet(`/api/grids/${encodeURIComponent(gridId)}/map-matching?limit=1000${sequenceParam}${visualParam}${gpsAccuracyParam}`);
+    const result = await apiGet(`/api/grids/${encodeURIComponent(gridId)}/map-matching?limit=1000${sequenceParam}${providerParam}${visualParam}${gpsAccuracyParam}`);
     if (sequence !== mapMatchingSequence) return;
     clearMapMatching();
     currentConfirmedMapMatchingPointFeatures = [];
@@ -1069,11 +1149,11 @@ async function runMapMatchingForCurrentGrid(useVisualUserType = true) {
       const firstSummary = currentMapMatchingSegmentSummaries[0] || {};
       const typeStatus = firstSummary.user_type_status || {};
       const typeText = typeStatus.total
-        ? `当前类型票 ${Number(typeStatus.winner_votes || 0)}/${Number(typeStatus.total || 0)}，覆盖率 ${((Number(typeStatus.coverage_ratio || 0)) * 100).toFixed(0)}%，需要至少 ${((Number(typeStatus.min_coverage_ratio || 0.4)) * 100).toFixed(0)}%。`
+        ? `当前类型票 ${Number(typeStatus.winner_votes || 0)}/${Number(typeStatus.total || 0)}，覆盖率 ${((Number(typeStatus.coverage_ratio || 0)) * 100).toFixed(0)}%，需要至少 ${((Number(typeStatus.min_coverage_ratio || MAP_MATCHING_CAPTURE_POSITION_MIN_COVERAGE)) * 100).toFixed(0)}%。`
         : "";
       const message = hasProcessableRawTrajectory
-        ? `已显示橙色原始子轨迹，还没有蓝色 matched 轨迹。${typeText}请先选择子轨迹并点击“Process 当前子轨迹图片”，处理完成后再次运行匹配。`
-        : `Map matching：没有蓝色 matched 轨迹：${result.reason || "GraphHopper 不可用"}。`;
+        ? `已显示橙色原始轨迹，还没有蓝色 matched 轨迹。${typeText}请先选择轨迹并点击“Process 当前轨迹图片”，处理完成后再次运行匹配。`
+        : `Map matching：没有蓝色 matched 轨迹：${result.reason || `${providerLabel} 不可用`}。`;
       mapDataStatusElement.textContent = message;
       if (mapMatchingStatusElement) {
         mapMatchingStatusElement.textContent = message;
@@ -1095,7 +1175,7 @@ async function runMapMatchingForCurrentGrid(useVisualUserType = true) {
       ? ` 当前显示 segment ${currentMapMatchingSelectedSegment}，可在列表中切换后分别确认/处理。`
       : "";
     const modeText = useVisualUserType ? "按 capture_position" : "直接几何";
-    const message = `GraphHopper ${modeText} map matching 完成：sequence ${result.meta.sequence_id || "unknown"}，${result.meta.matched}/${result.meta.count} 个点${cacheText}，蓝色 matched 轨迹 ${matchedCount}${segmentText}${distanceText}。${selectedSegmentText}请检查预览点，确认后再保存位置。`;
+    const message = `${providerLabel} ${modeText} map matching 完成：sequence ${result.meta.sequence_id || "unknown"}，${result.meta.matched}/${result.meta.count} 个点${cacheText}，蓝色 matched 轨迹 ${matchedCount}${segmentText}${distanceText}。${selectedSegmentText}请检查预览点，确认后再保存位置。`;
     mapDataStatusElement.textContent = message;
     if (mapMatchingStatusElement) {
       mapMatchingStatusElement.classList.remove("error");
@@ -1106,7 +1186,7 @@ async function runMapMatchingForCurrentGrid(useVisualUserType = true) {
     if (sequence !== mapMatchingSequence) return;
     clearMapMatching();
     if (mapMatchingStatusElement) {
-      mapMatchingStatusElement.textContent = `GraphHopper map matching 失败：${error.message}`;
+      mapMatchingStatusElement.textContent = `${providerLabel} map matching 失败：${error.message}`;
       mapMatchingStatusElement.classList.add("error");
     }
   } finally {
@@ -1802,13 +1882,11 @@ function mapMatchedFeatureToVlmImage(feature) {
 
 function currentTrajectoryVlmImages() {
   const seen = new Set();
-  const sourceFeatures = currentMapMatchingPointFeatures.length
-    ? currentMapMatchingPointFeatures
-    : currentConfirmedMapMatchingPointFeatures;
+  const sourceFeatures = currentMapMatchingTrajectoryFeatures();
   return sourceFeatures
     .slice()
     .sort((a, b) => (
-      Number(a.properties?.segment_index ?? 0) - Number(b.properties?.segment_index ?? 0)
+      String(a.properties?.captured_at || "").localeCompare(String(b.properties?.captured_at || ""))
       || Number(a.properties?.idx ?? 0) - Number(b.properties?.idx ?? 0)
     ))
     .map(mapMatchedFeatureToVlmImage)
@@ -1825,7 +1903,7 @@ async function startCurrentTrajectoryVlmJob() {
   if (imagesToProcess.length === 0) {
     if (mapMatchingStatusElement) {
       mapMatchingStatusElement.classList.add("error");
-      mapMatchingStatusElement.textContent = "当前还没有可处理的轨迹图像点。先运行轨迹拆分或选择一个子轨迹。";
+      mapMatchingStatusElement.textContent = "当前还没有可处理的轨迹图像点。请先确认访问 Mapillary 并选择一条轨迹。";
     }
     return;
   }
@@ -1834,7 +1912,7 @@ async function startCurrentTrajectoryVlmJob() {
   resetVlmProgress(0, Math.max(imagesToProcess.length, 1));
   processCurrentTrajectoryVlmButton.disabled = true;
   vlmStatusElement.classList.remove("error");
-  vlmStatusElement.textContent = `正在把当前子轨迹 ${imagesToProcess.length} 张图片加入当前 cell 的 VLM 队列；已有结果会更新位置元数据，不重复调用模型。`;
+  vlmStatusElement.textContent = `正在把当前轨迹 ${imagesToProcess.length} 张图片加入当前 cell 的 VLM 队列；已有结果会更新位置元数据，不重复调用模型。`;
 
   try {
     const job = await apiPost(`/api/grids/${encodeURIComponent(gridId)}/vlm-jobs`, {
@@ -2595,6 +2673,32 @@ runGraphhopperDirectButton?.addEventListener("click", () => runMapMatchingForCur
 runGraphhopperMatchingButton?.addEventListener("click", () => runMapMatchingForCurrentGrid(true));
 confirmCurrentMapMatchingButton?.addEventListener("click", confirmCurrentMapMatching);
 processCurrentTrajectoryVlmButton?.addEventListener("click", startCurrentTrajectoryVlmJob);
+mapMatchingProviderSelect?.addEventListener("change", () => {
+  selectedMapMatchingProvider = mapMatchingProviderSelect.value === "valhalla" ? "valhalla" : "graphhopper";
+  clearMapMatching();
+  updateMapMatchingProviderHealth();
+  const selectedFeatures = selectedMapMatchingSequenceFeatures();
+  const readiness = selectedSequenceCapturePositionReadiness(selectedFeatures);
+  if (mapMatchingStatusElement) {
+    mapMatchingStatusElement.classList.remove("error");
+    mapMatchingStatusElement.textContent = selectedFeatures.length
+      ? `已切换到 ${selectedMapMatchingProviderLabel()}。当前轨迹 ${selectedFeatures.length} 张；按 capture_position matching 需要 35% 点已有结果：${readiness.voted}/${readiness.total}。`
+      : `已切换到 ${selectedMapMatchingProviderLabel()}。请先确认访问 Mapillary 并选择轨迹。`;
+  }
+  updateMapMatchingButtonState();
+});
+mapMatchingSequenceSelect?.addEventListener("change", () => {
+  clearMapMatching();
+  const selectedFeatures = selectedMapMatchingSequenceFeatures();
+  const readiness = selectedSequenceCapturePositionReadiness(selectedFeatures);
+  if (mapMatchingStatusElement) {
+    mapMatchingStatusElement.classList.remove("error");
+    mapMatchingStatusElement.textContent = selectedFeatures.length
+      ? `已选择轨迹 ${selectedFeatures.length} 张。${selectedMapMatchingProviderLabel()} 直接 matching 可立即运行；按 capture_position matching 需要 35% 点已有结果：${readiness.voted}/${readiness.total}。`
+      : "当前没有可用轨迹。请先确认访问 Mapillary。";
+  }
+  updateMapMatchingButtonState();
+});
 mapMatchingSegmentSelect?.addEventListener("change", () => {
   currentMapMatchingSelectedSegment = Number(mapMatchingSegmentSelect.value || 0);
   currentConfirmedMapMatchingPointFeatures = [];
